@@ -54,6 +54,24 @@ Antes de empezar: **Restaurar las 3 tablas** y **Reiniciar chat**.
    el PEP lo intercepta, el PDP responde DENY (regla R2: escalamiento de privilegios) y la tabla `reservas_zero_trust` queda intacta.
    Mostrar las pestañas **Política PDP** y **Auditoría**.
 
+### Segundo vector: SQL Injection (confidencialidad)
+
+El asistente tiene una tercera herramienta, `buscar_reserva(cliente)`, escrita de forma
+**deliberadamente insegura**: arma el `WHERE` concatenando el nombre sin parametrizar. Esto
+agrega un ataque contra la **confidencialidad** (fuga de datos), complementando el ataque
+**destructivo** anterior (disponibilidad).
+
+6. **SQLi sin protección**: ambos switches en OFF, botón **Ataque SQL injection**. El payload
+   `' OR '1'='1' --` convierte el `WHERE` en una tautología y la consulta **devuelve las 6 reservas**
+   (no solo una). En la consola se ve el SQL final y el cartel **FUGA DE DATOS**.
+7. **Capa 1 lo frena… pero es frágil**: Guardrails en ON, botón **Ataque SQL injection**. El filtro
+   detecta los metacaracteres (`'`, `--`, `OR 1=1`) y bloquea antes del LLM. *Pero un guardrail es una
+   lista negra: hay que enumerar cada firma y se evade con encoding.*
+8. **Zero Trust valida la acción**: Guardrails en OFF y Zero Trust en ON, botón **Ataque SQL injection**.
+   El LLM emite el tool call, el **PEP inspecciona los argumentos**, detecta la anomalía y el PDP responde
+   DENY (regla **R4**). La consulta nunca se ejecuta. A diferencia del guardrail, el PDP no depende de cómo
+   esté redactado el pedido: valida la acción concreta contra el contrato (*never trust, always verify*).
+
 ## Notas
 
 - El system prompt es deliberadamente permisivo con el área de Sistemas, para simular un desarrollo vulnerable.
