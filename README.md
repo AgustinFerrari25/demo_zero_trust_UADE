@@ -7,6 +7,7 @@ seguridad que se activan desde la barra lateral:
 |------|-------------|----------|
 | 1 · Guardrail | Antes del LLM | Filtra el texto del usuario por patrones de prompt injection |
 | 2 · Zero Trust | Entre el LLM y la base de datos | El **PEP** pausa cada tool call y consulta al **PDP** (Policy Engine + Policy Administrator), que decide con una política declarativa *default deny* |
+| 3 · DLP de salida | Después del LLM | Inspecciona la **respuesta** del modelo y enmascara datos sensibles (fuga de PII o de instrucciones internas) |
 
 ## Puesta en marcha
 
@@ -71,6 +72,23 @@ agrega un ataque contra la **confidencialidad** (fuga de datos), complementando 
    El LLM emite el tool call, el **PEP inspecciona los argumentos**, detecta la anomalía y el PDP responde
    DENY (regla **R4**). La consulta nunca se ejecuta. A diferencia del guardrail, el PDP no depende de cómo
    esté redactado el pedido: valida la acción concreta contra el contrato (*never trust, always verify*).
+
+### Cuarto vector: la defensa también está en la salida (Capa 3 · DLP)
+
+La Capa 1 filtra la **entrada**; la Capa 3 filtra la **salida** (LLM → usuario). Aunque
+el ataque logre que el modelo devuelva datos, la respuesta se inspecciona antes de
+mostrarla. Es el cierre natural del ataque de SQL injection cuando las capas previas
+están apagadas.
+
+9. **Sin protección**: ambos switches de seguridad en OFF y **Ataque SQL injection**.
+    La consulta se ejecuta y la respuesta muestra las **6 reservas con nombres reales**.
+10. **Capa 3 contiene la fuga**: dejá Guardrails y Zero Trust en OFF y prendé **DLP de
+    salida**. Repetí el **Ataque SQL injection**: los datos se devuelven igual, pero los
+    nombres salen enmascarados (`M**** G*******`) y aparece el aviso
+    *"⚠️ Se detectó y redactó información sensible"*; en la consola se ve el evento
+    **CAPA 3 · DLP — DATOS ENMASCARADOS**.
+    *Conclusión: la defensa en profundidad no termina en la entrada; la salida del LLM
+    también es una superficie de exfiltración.*
 
 ## Notas
 
