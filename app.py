@@ -1297,7 +1297,8 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
     todas = ["u_g", "g_l", "u_l", "l_p", "p_d", "s_d", "d_p", "p_db", "p_l", "l_dlp", "dlp_u", "l_u"]
 
     n = max(len(secuencia), 1)
-    dur = 0.7 * n  # segundos por ciclo
+    seg_por_paso = 1.3  # segundos que tarda cada flecha en encenderse (ajustá a gusto)
+    dur = seg_por_paso * n  # segundos por ciclo
     reglas = []
     for i, k in enumerate(secuencia):
         p0 = 100.0 * i / n           # enciende
