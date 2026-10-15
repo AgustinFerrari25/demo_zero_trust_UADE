@@ -375,8 +375,9 @@ def guardrail_check(texto: str) -> dict:
 # vector del ataque de SQL injection (fuga de datos / confidencialidad) que las
 # capas anteriores sólo contienen si están activas.
 
-# Registro con forma "Nombre Apellido (YYYY-MM-DD)", tal como los devuelve la
-# herramienta buscar_reserva. Varios de estos en una respuesta = fuga masiva.
+# Respaldo basado en formato: "Nombre Apellido (YYYY-MM-DD)". La detección
+# principal no usa esto, sino los valores reales devueltos por las herramientas
+# (ver dlp_check), que es robusto a cómo redacte el modelo la respuesta.
 PATRON_PII = re.compile(
     r"([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)\s*\((\d{4}-\d{2}-\d{2})\)"
 )
@@ -392,20 +393,56 @@ def _enmascarar_nombre(nombre: str) -> str:
     return " ".join(p[0] + "*" * (len(p) - 1) if len(p) > 1 else p for p in nombre.split())
 
 
-def dlp_check(texto: str) -> dict:
+def _enmascarar_valores(texto: str, valores: list[str]) -> tuple[str, bool]:
+    """Reemplaza en el texto cada valor sensible (sin distinguir mayúsculas).
+
+    Devuelve (texto_enmascarado, si_reemplazo_algo). Se procesan primero los
+    valores más largos para no pisar nombres que son prefijo de otro.
+    """
+    cambio = False
+    for valor in sorted(set(valores), key=len, reverse=True):
+        patron = re.compile(re.escape(valor), re.IGNORECASE)
+        if patron.search(texto):
+            texto = patron.sub(_enmascarar_nombre(valor), texto)
+            cambio = True
+    return texto, cambio
+
+
+def dlp_check(texto: str, valores_sensibles: list[str] | None = None) -> dict:
     """Inspecciona la respuesta del LLM y enmascara datos sensibles.
 
-    Detecta: (1) fuga masiva de PII (varios registros 'Nombre (fecha)') y
-    (2) fuga del prompt de sistema. Devuelve el texto posiblemente enmascarado.
+    Es robusto al FORMATO: no depende de cómo redacte el modelo, sino que
+    enmascara los VALORES concretos que devolvieron las herramientas durante la
+    petición (por ejemplo, los clientes que devolvió una consulta). Así funciona
+    igual si el modelo responde en texto, en tabla markdown o en lista.
+
+    Cubre además, como respaldo, el patrón 'Nombre (fecha)' y la fuga de
+    términos internos del sistema.
     """
+    valores_sensibles = [v for v in (valores_sensibles or []) if v]
     hallazgos = []
     salida = texto
 
-    coincidencias = PATRON_PII.findall(salida)
-    if len(coincidencias) >= 2:  # una sola coincidencia puede ser una consulta legítima
-        hallazgos.append({"tipo": "fuga_pii", "detalle": f"{len(coincidencias)} registros con nombre y fecha"})
-        salida = PATRON_PII.sub(lambda m: f"{_enmascarar_nombre(m.group(1))} ({m.group(2)})", salida)
+    # 1) Fuga de datos: si una herramienta devolvió VARIOS registros sensibles,
+    #    se enmascaran todos sus valores tal cual aparezcan en la respuesta.
+    if len(set(valores_sensibles)) >= 2:
+        salida, reemplazado = _enmascarar_valores(salida, valores_sensibles)
+        if reemplazado:
+            hallazgos.append(
+                {
+                    "tipo": "fuga_pii",
+                    "detalle": f"{len(set(valores_sensibles))} registros sensibles devueltos por la herramienta",
+                }
+            )
 
+    # 2) Respaldo: patrón 'Nombre Apellido (YYYY-MM-DD)' cuando no hay valores conocidos.
+    if not hallazgos:
+        coincidencias = PATRON_PII.findall(salida)
+        if len(coincidencias) >= 2:  # una sola coincidencia puede ser una consulta legítima
+            salida = PATRON_PII.sub(lambda m: f"{_enmascarar_nombre(m.group(1))} ({m.group(2)})", salida)
+            hallazgos.append({"tipo": "fuga_pii", "detalle": f"{len(coincidencias)} registros con nombre y fecha"})
+
+    # 3) Fuga del prompt de sistema / instrucciones internas.
     normalizado = _normalizar(salida)
     internos = [t for t in DLP_TERMINOS_INTERNOS if t in normalizado]
     if internos:
@@ -420,11 +457,20 @@ def dlp_check(texto: str) -> dict:
     return {"redactado": redactado, "texto": salida, "hallazgos": hallazgos, "resumen": resumen}
 
 
-def DLP_salida(texto: str, dlp_on: bool, consola: Consola) -> str:
-    """Aplica la Capa 3 a la respuesta final del LLM (o la deja pasar si está OFF)."""
+def DLP_salida(
+    texto: str,
+    dlp_on: bool,
+    consola: Consola,
+    valores_sensibles: list[str] | None = None,
+) -> str:
+    """Aplica la Capa 3 a la respuesta final del LLM (o la deja pasar si está OFF).
+
+    `valores_sensibles` son los datos que devolvieron las herramientas en esta
+    petición; se usan para enmascarar la respuesta sin depender de su formato.
+    """
     if not dlp_on:
         return texto
-    resultado = dlp_check(texto)
+    resultado = dlp_check(texto, valores_sensibles)
     if resultado["redactado"]:
         consola.log(
             "CAPA 3 · DLP",
@@ -1036,6 +1082,10 @@ def procesar_mensaje(
     messages += [{"role": m["role"], "content": m["content"]} for m in historial if m.get("llm")][-MAX_HISTORIAL:]
     messages.append({"role": "user", "content": prompt})
 
+    # Valores sensibles que devuelvan las herramientas en esta petición: insumo
+    # para la Capa 3 (DLP), que enmascara esos datos en la respuesta del modelo.
+    valores_sensibles: list[str] = []
+
     for _ in range(MAX_RONDAS_TOOLS):
         t0 = time.perf_counter()
         try:
@@ -1054,7 +1104,7 @@ def procesar_mensaje(
 
         if not msg.tool_calls:
             consola.log("LLM", "info", f"Respuesta en texto ({ms:.0f} ms, `{MODELO_NOMBRE}`)")
-            return {"content": DLP_salida(msg.content or "", dlp_on, consola), "llm": True}
+            return {"content": DLP_salida(msg.content or "", dlp_on, consola, valores_sensibles), "llm": True}
 
         llamadas = [{"tool": tc.function.name, "arguments": tc.function.arguments} for tc in msg.tool_calls]
         consola.log(
@@ -1080,6 +1130,9 @@ def procesar_mensaje(
         )
         for tc in msg.tool_calls:
             resultado = PEP_intercept(tc, AI_IDENTITY, tabla, zt_on, guard_on, consola, señales)
+            for fila in resultado.get("reservas", []) or []:
+                if isinstance(fila, dict) and fila.get("cliente"):
+                    valores_sensibles.append(fila["cliente"])
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(resultado, default=str)})
 
     consola.log("LLM", "warning", "Se alcanzó el límite de rondas de herramientas")
