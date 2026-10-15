@@ -1234,19 +1234,21 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
 
     # Aristas como polilíneas: se usan tanto para dibujar como para el recorrido
     # del paquete, así el punto que avanza sigue EXACTAMENTE el camino dibujado.
+    # La ida y la vuelta de cada tramo son líneas DISTINTAS y paralelas, para que
+    # sus flechas no se superpongan (p. ej. LLM↔PEP y los bypass de abajo).
     E = {
         "u_g":   [(160, 301), (250, 301)],
         "g_l":   [(390, 301), (470, 301)],
-        "u_l":   [(110, 322), (180, 400), (320, 432), (430, 392), (468, 330)],
-        "l_p":   [(706, 282), (836, 150)],
-        "p_d":   [(1072, 116), (1154, 116)],
-        "d_p":   [(1154, 148), (1072, 148)],
-        "p_db":  [(956, 160), (1300, 282)],
-        "p_l":   [(850, 150), (762, 222), (708, 278)],
-        "l_dlp": [(696, 320), (880, 408)],
-        "l_u":   [(478, 338), (380, 430), (300, 470), (200, 460), (136, 332)],
-        "dlp_u": [(938, 468), (700, 540), (450, 545), (250, 500), (150, 340)],
-        "s_d":   [(1280, 468), (1298, 184)],
+        "u_l":   [(118, 329), (238, 396), (350, 410), (444, 378), (468, 332)],
+        "l_p":   [(719, 316), (959, 173)],
+        "p_d":   [(1072, 112), (1156, 112)],
+        "d_p":   [(1156, 152), (1072, 152)],
+        "p_db":  [(952, 166), (1300, 284)],
+        "p_l":   [(941, 143), (713, 283)],
+        "l_dlp": [(700, 326), (900, 398)],
+        "l_u":   [(492, 341), (392, 470), (296, 508), (192, 480), (150, 331)],
+        "dlp_u": [(938, 468), (700, 542), (452, 550), (232, 502), (101, 328)],
+        "s_d":   [(1282, 466), (1300, 186)],
     }
     activo = {
         "u_g": guard_on, "g_l": guard_on, "u_l": not guard_on,
@@ -1257,9 +1259,12 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
     capas = []
     for eid, pts in E.items():
         d = "M " + " L ".join(f"{x} {y}" for x, y in pts)
-        clase = "edge active" if activo[eid] else "edge inactive"
-        marcador = "flecha" if activo[eid] else "flecha_gris"
-        capas.append(f'<path class="{clase}" d="{d}" marker-end="url(#{marcador})"/>')
+        if activo[eid]:
+            capas.append(f'<path class="edge active" d="{d}" marker-end="url(#flecha)"/>')
+        else:
+            # Sin punta de flecha en las capas desactivadas: evita que las flechas
+            # de ida y vuelta se superpongan cuando hay varias capas apagadas.
+            capas.append(f'<path class="edge inactive" d="{d}"/>')
 
     # Recorrido del paquete, PASO A PASO, según las capas activas:
     # Usuario → [Capa 1] → LLM → PEP → [PDP] → recurso → PEP → LLM → [Capa 3] → Usuario
@@ -1322,9 +1327,6 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
   <defs>
     <marker id="flecha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#43a047"/>
-    </marker>
-    <marker id="flecha_gris" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#90a4ae"/>
     </marker>
   </defs>
   {''.join(capas)}
