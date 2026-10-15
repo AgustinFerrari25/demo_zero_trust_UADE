@@ -1466,6 +1466,18 @@ def render_sidebar() -> tuple[bool, bool, bool, dict]:
     return guard_on, zt_on, dlp_on, señales
 
 
+def _embed_html(html: str, height: int) -> None:
+    """Embebe HTML autocontenido en un iframe.
+
+    Usa `st.iframe` (API nueva) y cae a `components.html` en versiones viejas de
+    Streamlit, donde `st.iframe` todavía no existe.
+    """
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+    else:  # pragma: no cover - compatibilidad con Streamlit < 1.6x
+        components.html(html, height=height)
+
+
 def main() -> None:
     st.set_page_config(page_title="Zero Trust para LLMs", layout="wide")
     init_state()
@@ -1488,7 +1500,7 @@ def main() -> None:
             help="Alterna entre el diagrama estático (Graphviz) y la animación del flujo en loop.",
         )
         if ver_animacion:
-            components.html(diagrama_animado(guard_on, zt_on, dlp_on, señales), height=540)
+            _embed_html(diagrama_animado(guard_on, zt_on, dlp_on, señales), height=540)
         else:
             st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on))
 
