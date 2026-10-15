@@ -1184,7 +1184,8 @@ def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None, dlp_on: 
       S -> D [label="postura / riesgo"];
       D -> P [label="PERMIT / DENY"];
       P -> DB [label="solo si PERMIT"];
-      L -> DLP [label="respuesta"];
+      P -> L [label="resultado / denegación", style=dashed, constraint=false];
+      L -> DLP [label="respuesta en texto"];
       DLP -> U [label="respuesta filtrada"];
     }}"""
 
