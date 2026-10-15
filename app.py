@@ -1271,7 +1271,8 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
     ruta = [("u_g", False), ("g_l", False)] if guard_on else [("u_l", False)]
     ruta += [("l_p", False)]
     if zt_on:
-        ruta += [("p_d", False), ("d_p", False)]
+        # El PDP decide con el contexto: el paquete baja a las señales y vuelve.
+        ruta += [("p_d", False), ("s_d", True), ("s_d", False), ("d_p", False)]
     ruta += [("p_db", False), ("p_db", True)]  # va al recurso y vuelve
     ruta += [("p_l", False)]
     ruta += [("l_dlp", False), ("dlp_u", False)] if dlp_on else [("l_u", False)]
@@ -1287,7 +1288,7 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
 
     camino = "M " + " L ".join(f"{x} {y}" for x, y in puntos_ruta)
     total = sum(_dist(puntos_ruta[i - 1], puntos_ruta[i]) for i in range(1, len(puntos_ruta))) or 1.0
-    velocidad, pausa = 520.0, 0.30  # px/s y segundos de pausa por nodo
+    velocidad, pausa = 650.0, 0.26  # px/s y segundos de pausa por nodo
     kp, kt, largo, t = [0.0], [0.0], 0.0, 0.0
     for i in range(1, len(puntos_ruta)):
         seg = _dist(puntos_ruta[i - 1], puntos_ruta[i])
