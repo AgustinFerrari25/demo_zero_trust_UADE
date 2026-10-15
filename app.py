@@ -45,6 +45,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -1234,6 +1235,129 @@ def diagrama(
     }}"""
 
 
+# Estilos base del diagrama animado (el resto de las reglas, una por flecha, se
+# generan en diagrama_animado()).
+_DIAGRAMA_ANIMADO_CSS = """
+* { box-sizing: border-box; }
+body { margin: 0; background: transparent; font-family: Helvetica, Arial, sans-serif; }
+.wrap { width: 100%; }
+svg { width: 100%; height: auto; display: block; }
+.paso, .apagada { fill: none; stroke-linejoin: round; stroke-linecap: round; }
+.paso { stroke: #546e7a; stroke-width: 3; }
+.apagada { stroke: #37474f; stroke-width: 2.5; stroke-dasharray: 4 6; opacity: 0.4; }
+.leyenda { color: #78909c; font-size: 12px; text-align: center; margin: 6px 0 2px; }
+"""
+
+
+def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict | None = None) -> str:
+    """Diagrama ANIMADO del flujo (HTML/SVG autocontenido) para embeber con st.iframe.
+
+    Recorre el camino habilitado PASO A PASO: cada flecha se ENCIENDE cuando la
+    "data" pasa por ella y se APAGA al salir, en loop. Usa el mismo layout que el
+    diagrama Graphviz. La secuencia es puro CSS: se genera un @keyframes por flecha.
+    No usa JavaScript.
+    """
+    riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
+    color_riesgo = {"bajo": "#2e7d32", "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
+    verde, gris = "#2e7d32", "#78909c"
+    modelo = MODELO_NOMBRE if len(MODELO_NOMBRE) <= 26 else MODELO_NOMBRE[:24] + "…"
+
+    def nodo(x, y, w, h, color, lineas):
+        cx, cy = x + w / 2, y + h / 2
+        n = len(lineas)
+        txt = ""
+        for i, t in enumerate(lineas):
+            dy = (i - (n - 1) / 2) * 15
+            size = 15 if i == 0 else 11
+            peso = 600 if i == 0 else 400
+            txt += (
+                f'<text x="{cx}" y="{cy + dy + 5}" text-anchor="middle" '
+                f'font-size="{size}" fill="#ffffff" font-weight="{peso}">{t}</text>'
+            )
+        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="10" fill="{color}"/>{txt}'
+
+    E = {
+        "u_g":   [(160, 301), (250, 301)],
+        "g_l":   [(390, 301), (470, 301)],
+        "u_l":   [(118, 329), (238, 396), (350, 410), (444, 378), (468, 332)],
+        "l_p":   [(719, 316), (959, 173)],
+        "p_d":   [(1072, 112), (1156, 112)],
+        "d_p":   [(1156, 152), (1072, 152)],
+        "p_db":  [(952, 166), (1300, 284)],
+        "p_l":   [(941, 143), (713, 283)],
+        "l_dlp": [(700, 326), (900, 398)],
+        "l_u":   [(492, 341), (392, 470), (296, 508), (192, 480), (150, 331)],
+        "dlp_u": [(938, 468), (700, 542), (452, 550), (232, 502), (101, 328)],
+        "s_d":   [(1282, 466), (1300, 186)],
+    }
+
+    # Secuencia de flechas que recorre la data (una por paso), según las capas activas.
+    secuencia = ["u_g", "g_l"] if guard_on else ["u_l"]
+    secuencia += ["l_p"]
+    if zt_on:
+        secuencia += ["p_d", "s_d", "d_p"]  # el PDP consulta las señales
+    secuencia += ["p_db", "p_l"]
+    secuencia += ["l_dlp", "dlp_u"] if dlp_on else ["l_u"]
+
+    n = max(len(secuencia), 1)
+    dur = 0.7 * n  # segundos por ciclo completo
+    slot = {}
+    reglas = []
+    for i, eid in enumerate(secuencia):
+        slot[eid] = i
+        p0 = 100.0 * i / n            # enciende
+        p1 = 100.0 * (i + 0.8) / n    # se apaga (deja una pausa antes del próximo paso)
+        reglas.append(
+            f"@keyframes k{i}{{"
+            f"0%,{p0:.2f}%{{stroke:#546e7a;stroke-width:3}}"
+            f"{p0 + 0.02:.2f}%,{p1:.2f}%{{stroke:#43a047;stroke-width:4.6}}"
+            f"{p1 + 0.02:.2f}%,100%{{stroke:#546e7a;stroke-width:3}}"
+            f"}}"
+            f".e{i}{{animation:k{i} {dur:.2f}s linear infinite}}"
+        )
+
+    capas = []
+    for eid, pts in E.items():
+        d = "M " + " L ".join(f"{x} {y}" for x, y in pts)
+        if eid in slot:
+            capas.append(f'<path class="paso e{slot[eid]}" d="{d}" marker-end="url(#flecha)"/>')
+        else:
+            capas.append(f'<path class="apagada" d="{d}"/>')
+
+    nodos = [
+        nodo(40, 275, 120, 52, "#455a64", ["Usuario"]),
+        nodo(250, 270, 140, 62, verde if guard_on else gris, ["Capa 1", "Guardrail"]),
+        nodo(470, 265, 240, 72, "#6a1b9a", ["LLM", modelo]),
+        nodo(830, 90, 240, 68, verde if zt_on else gris, ["PEP", "Policy Enforcement Point"]),
+        nodo(1160, 90, 280, 90, verde if zt_on else gris, ["PDP", "Policy Engine +", "Policy Administrator"]),
+        nodo(1210, 285, 190, 62, "#1565c0", ["SQLite (simulada)"]),
+        nodo(860, 400, 210, 70, verde if dlp_on else gris, ["Capa 3", "DLP de salida"]),
+        nodo(1150, 470, 260, 76, color_riesgo, ["Señales de sesión", f"riesgo {riesgo['nivel']}"]),
+    ]
+
+    css = _DIAGRAMA_ANIMADO_CSS + "\n" + "\n".join(reglas)
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>{css}</style>
+</head>
+<body>
+<div class="wrap">
+<svg viewBox="0 0 1480 620" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="flecha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#43a047"/>
+    </marker>
+  </defs>
+  {''.join(capas)}
+  {''.join(nodos)}
+</svg>
+<div class="leyenda">Cada flecha se enciende cuando la data pasa por ella y se apaga al salir (en loop) · capas en gris = desactivadas</div>
+</div>
+</body>
+</html>"""
+
+
 def render_traza(traza: dict) -> None:
     for i, ev in enumerate(traza["eventos"], 1):
         NIVEL_UI[ev["nivel"]](f"**{i}. [{ev['capa']}]** {ev['titulo']}")
@@ -1360,6 +1484,18 @@ def render_sidebar() -> tuple[bool, bool, bool, dict]:
     return guard_on, zt_on, dlp_on, señales
 
 
+def _embed_html(html: str, height: int) -> None:
+    """Embebe HTML autocontenido en un iframe.
+
+    Usa `st.iframe` (API nueva) y cae a `components.html` en versiones viejas de
+    Streamlit, donde `st.iframe` todavía no existe.
+    """
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+    else:  # pragma: no cover - compatibilidad con Streamlit < 1.6x
+        components.html(html, height=height)
+
+
 def main() -> None:
     st.set_page_config(page_title="Zero Trust para LLMs", layout="wide")
     init_state()
@@ -1376,12 +1512,15 @@ def main() -> None:
     if simulados:
         st.info(f"Modo simulado activo: {' y '.join(simulados)} (configurable en .env con FAKE_DB / FAKE_LLM).")
     with st.expander("Arquitectura", expanded=True):
-        resaltar = st.toggle(
-            "Resaltar el flujo activo",
-            key="resaltar_flujo",
-            help="Colorea las flechas según las capas activas: verde = habilitada, gris = deshabilitada.",
+        animar = st.toggle(
+            "Animar el flujo (secuencial)",
+            key="animar_flujo",
+            help="Cada flecha se enciende cuando la data pasa por ella y se apaga al salir, en loop.",
         )
-        st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on, resaltar))
+        if animar:
+            _embed_html(diagrama_animado(guard_on, zt_on, dlp_on, señales), height=560)
+        else:
+            st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on, resaltar=True))
 
     col_chat, col_consola = st.columns([1, 1.15], gap="large")
 
