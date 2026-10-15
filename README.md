@@ -1,12 +1,13 @@
 # PoC: Defensa en Profundidad para LLMs (Guardrails + Zero Trust NIST SP 800-207)
 
-Asistente de reservas con un LLM real (OpenRouter, Function Calling) y dos capas de
+Asistente de reservas con un LLM real (OpenRouter, Function Calling) y tres capas de
 seguridad que se activan desde la barra lateral:
 
 | Capa | Dónde actúa | Qué hace |
 |------|-------------|----------|
 | 1 · Guardrail | Antes del LLM | Filtra el texto del usuario por patrones de prompt injection |
 | 2 · Zero Trust | Entre el LLM y la base de datos | El **PEP** pausa cada tool call y consulta al **PDP** (Policy Engine + Policy Administrator), que decide con una política declarativa *default deny* |
+| 3 · DLP de salida | Después del LLM | Inspecciona la **respuesta** del modelo y enmascara datos sensibles (fuga de PII o de instrucciones internas) |
 
 La Capa 2 además evalúa el **contexto de la sesión** (postura): dispositivo administrado,
 MFA y red confiable. Cada señal adversa eleva el *riesgo*, y con `riesgo ≥ 1` el PDP
@@ -89,6 +90,23 @@ eleva el riesgo y activa la regla **R6/R7** (DENY), incluso para una reserva leg
     legítima cae por **DENY (R6)** — el indicador de riesgo pasa a ámbar/rojo y se ve en
     la consola la postura débil. Volvé a prender MFA y la acción se autoriza de nuevo.
     *Conclusión: la autorización depende del contexto, no de una lista fija de acciones.*
+
+### Cuarto vector: la defensa también está en la salida (Capa 3 · DLP)
+
+La Capa 1 filtra la **entrada**; la Capa 3 filtra la **salida** (LLM → usuario). Aunque
+el ataque logre que el modelo devuelva datos, la respuesta se inspecciona antes de
+mostrarla. Es el cierre natural del ataque de SQL injection cuando las capas previas
+están apagadas.
+
+10. **Sin protección**: ambos switches de seguridad en OFF y **Ataque SQL injection**.
+    La consulta se ejecuta y la respuesta muestra las **6 reservas con nombres reales**.
+11. **Capa 3 contiene la fuga**: dejá Guardrails y Zero Trust en OFF y prendé **DLP de
+    salida**. Repetí el **Ataque SQL injection**: los datos se devuelven igual, pero los
+    nombres salen enmascarados (`M**** G*******`) y aparece el aviso
+    *"⚠️ Se detectó y redactó información sensible"*; en la consola se ve el evento
+    **CAPA 3 · DLP — DATOS ENMASCARADOS**.
+    *Conclusión: la defensa en profundidad no termina en la entrada; la salida del LLM
+    también es una superficie de exfiltración.*
 
 ## Notas
 

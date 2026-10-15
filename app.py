@@ -367,6 +367,78 @@ def guardrail_check(texto: str) -> dict:
 
 
 # =============================================================================
+# 5bis. CAPA 3 — DLP DE SALIDA (filtro sobre la respuesta del LLM)
+# =============================================================================
+# Mientras la Capa 1 filtra la ENTRADA (usuario → LLM), esta capa filtra la
+# SALIDA (LLM → usuario). Cierra el ciclo: aunque el ataque logre que el modelo
+# devuelva datos, la respuesta se inspecciona antes de mostrarla. Ataca el mismo
+# vector del ataque de SQL injection (fuga de datos / confidencialidad) que las
+# capas anteriores sólo contienen si están activas.
+
+# Registro con forma "Nombre Apellido (YYYY-MM-DD)", tal como los devuelve la
+# herramienta buscar_reserva. Varios de estos en una respuesta = fuga masiva.
+PATRON_PII = re.compile(
+    r"([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)\s*\((\d{4}-\d{2}-\d{2})\)"
+)
+
+# Términos que delatan la fuga del prompt de sistema / instrucciones internas.
+DLP_TERMINOS_INTERNOS = ["prompt injection", "guardrail", "system prompt", "instrucciones del sistema"]
+
+AVISO_DLP = "⚠️ Se detectó y redactó información sensible en la respuesta."
+
+
+def _enmascarar_nombre(nombre: str) -> str:
+    """Conserva la inicial de cada palabra y tapa el resto: 'Ana Pérez' -> 'A** P****'."""
+    return " ".join(p[0] + "*" * (len(p) - 1) if len(p) > 1 else p for p in nombre.split())
+
+
+def dlp_check(texto: str) -> dict:
+    """Inspecciona la respuesta del LLM y enmascara datos sensibles.
+
+    Detecta: (1) fuga masiva de PII (varios registros 'Nombre (fecha)') y
+    (2) fuga del prompt de sistema. Devuelve el texto posiblemente enmascarado.
+    """
+    hallazgos = []
+    salida = texto
+
+    coincidencias = PATRON_PII.findall(salida)
+    if len(coincidencias) >= 2:  # una sola coincidencia puede ser una consulta legítima
+        hallazgos.append({"tipo": "fuga_pii", "detalle": f"{len(coincidencias)} registros con nombre y fecha"})
+        salida = PATRON_PII.sub(lambda m: f"{_enmascarar_nombre(m.group(1))} ({m.group(2)})", salida)
+
+    normalizado = _normalizar(salida)
+    internos = [t for t in DLP_TERMINOS_INTERNOS if t in normalizado]
+    if internos:
+        hallazgos.append({"tipo": "fuga_prompt", "detalle": f"términos internos: {', '.join(internos)}"})
+        for termino in internos:
+            salida = re.sub(re.escape(termino), "[REDACTADO]", salida, flags=re.IGNORECASE)
+
+    redactado = bool(hallazgos)
+    if redactado:
+        salida = f"{salida}\n\n{AVISO_DLP}"
+    resumen = " · ".join(f"{h['tipo']}: {h['detalle']}" for h in hallazgos)
+    return {"redactado": redactado, "texto": salida, "hallazgos": hallazgos, "resumen": resumen}
+
+
+def DLP_salida(texto: str, dlp_on: bool, consola: Consola) -> str:
+    """Aplica la Capa 3 a la respuesta final del LLM (o la deja pasar si está OFF)."""
+    if not dlp_on:
+        return texto
+    resultado = dlp_check(texto)
+    if resultado["redactado"]:
+        consola.log(
+            "CAPA 3 · DLP",
+            "error",
+            f"DATOS ENMASCARADOS — {resultado['resumen']}",
+            resultado["hallazgos"],
+            expandir=True,
+        )
+        return resultado["texto"]
+    consola.log("CAPA 3 · DLP", "success", "Salida inspeccionada: sin datos sensibles")
+    return texto
+
+
+# =============================================================================
 # 6. CAPA 2 — ZERO TRUST: PDP (Policy Engine + Policy Administrator)
 # =============================================================================
 
@@ -927,6 +999,7 @@ def procesar_mensaje(
     zt_on: bool,
     consola: Consola,
     señales: dict | None = None,
+    dlp_on: bool = False,
 ) -> dict:
     """Pipeline completo de una petición. Devuelve el mensaje del asistente."""
     escenario = escenario_activo(guard_on, zt_on)
@@ -981,7 +1054,7 @@ def procesar_mensaje(
 
         if not msg.tool_calls:
             consola.log("LLM", "info", f"Respuesta en texto ({ms:.0f} ms, `{MODELO_NOMBRE}`)")
-            return {"content": msg.content or "", "llm": True}
+            return {"content": DLP_salida(msg.content or "", dlp_on, consola), "llm": True}
 
         llamadas = [{"tool": tc.function.name, "arguments": tc.function.arguments} for tc in msg.tool_calls]
         consola.log(
@@ -1032,12 +1105,13 @@ def init_state() -> None:
     st.session_state.setdefault("pendiente", None)
 
 
-def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None) -> str:
+def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None, dlp_on: bool = False) -> str:
     on, off = "#2e7d32", "#9e9e9e"
     g_color = on if guard_on else off
     z_color = on if zt_on else off
     riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
     s_color = {"bajo": on, "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
+    d_color = on if dlp_on else off
     return f"""
     digraph G {{
       rankdir=LR; bgcolor="transparent";
@@ -1049,6 +1123,7 @@ def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None) -> str:
       S  [label="Señales de sesión\\n(dispositivo · MFA · red)\\nriesgo {riesgo['nivel']}", fillcolor="{s_color}"];
       P  [label="PEP\\nPolicy Enforcement Point", fillcolor="{z_color}"];
       D  [label="PDP\\nPolicy Engine +\\nPolicy Administrator", fillcolor="{z_color}"];
+      DLP [label="Capa 3\\nDLP de salida", fillcolor="{d_color}"];
       DB [label="{DB_MOTOR}", shape=cylinder, fillcolor="#1565c0"];
       U -> G -> L;
       L -> P [label="tool_call"];
@@ -1056,6 +1131,8 @@ def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None) -> str:
       S -> D [label="postura / riesgo"];
       D -> P [label="PERMIT / DENY"];
       P -> DB [label="solo si PERMIT"];
+      L -> DLP [label="respuesta"];
+      DLP -> U [label="respuesta filtrada"];
     }}"""
 
 
@@ -1114,11 +1191,16 @@ def render_tablas(escenario: str) -> None:
                 st.rerun()
 
 
-def render_sidebar() -> tuple[bool, bool, dict]:
+def render_sidebar() -> tuple[bool, bool, bool, dict]:
     with st.sidebar:
         st.header("Capas de seguridad")
         guard_on = st.toggle("Activar Guardrails", key="guard_on", help="Capa 1: filtro de entrada antes del LLM")
         zt_on = st.toggle("Activar Zero Trust (PDP)", key="zt_on", help="Capa 2: PEP + PDP según NIST SP 800-207")
+        dlp_on = st.toggle(
+            "Activar DLP de salida",
+            key="dlp_on",
+            help="Capa 3: inspecciona la respuesta del LLM y enmascara datos sensibles (fuga de datos o de instrucciones)",
+        )
 
         escenario = escenario_activo(guard_on, zt_on)
         st.caption(f"Tabla destino: `{TABLAS[escenario]['tabla']}`")
@@ -1177,7 +1259,7 @@ def render_sidebar() -> tuple[bool, bool, dict]:
                     st.error(f"Error: {e}")
                 else:
                     st.success("Tablas creadas")
-    return guard_on, zt_on, señales
+    return guard_on, zt_on, dlp_on, señales
 
 
 def main() -> None:
@@ -1188,7 +1270,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         st.error(f"No se pudo crear la base simulada: {e}")
 
-    guard_on, zt_on, señales = render_sidebar()
+    guard_on, zt_on, dlp_on, señales = render_sidebar()
 
     st.title("Hotel Aws — Defensa en Profundidad para LLMs")
     st.caption("Prompt Injection vs. Guardrails + Zero Trust Architecture (NIST SP 800-207: PEP / PDP)")
@@ -1196,7 +1278,7 @@ def main() -> None:
     if simulados:
         st.info(f"Modo simulado activo: {' y '.join(simulados)} (configurable en .env con FAKE_DB / FAKE_LLM).")
     with st.expander("Arquitectura", expanded=True):
-        st.graphviz_chart(diagrama(guard_on, zt_on, señales))
+        st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on))
 
     col_chat, col_consola = st.columns([1, 1.15], gap="large")
 
@@ -1226,7 +1308,7 @@ def main() -> None:
             with st.chat_message("user"):
                 st.markdown(prompt)
             with st.chat_message("assistant"), st.spinner("Procesando por las capas de seguridad…"):
-                respuesta = procesar_mensaje(prompt, st.session_state.mensajes, guard_on, zt_on, consola, señales)
+                respuesta = procesar_mensaje(prompt, st.session_state.mensajes, guard_on, zt_on, consola, señales, dlp_on=dlp_on)
         st.session_state.mensajes.append({"role": "user", "content": prompt, "llm": respuesta["llm"]})
         st.session_state.mensajes.append({"role": "assistant", "content": respuesta["content"], "llm": respuesta["llm"]})
         st.session_state.trazas.append(consola.traza)
