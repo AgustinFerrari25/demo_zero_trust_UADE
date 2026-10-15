@@ -45,6 +45,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -1190,6 +1191,112 @@ def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None, dlp_on: 
     }}"""
 
 
+# Hoja de estilos del diagrama animado (CSS puro — anima y hace loop sin JS).
+_DIAGRAMA_ANIMADO_CSS = """
+* { box-sizing: border-box; }
+body { margin: 0; background: transparent; font-family: Helvetica, Arial, sans-serif; }
+.wrap { width: 100%; }
+svg { width: 100%; height: auto; display: block; }
+@keyframes flujo { to { stroke-dashoffset: -32; } }
+.edge { fill: none; stroke-width: 3; stroke-linecap: round; }
+.edge.active { stroke: #43a047; stroke-dasharray: 10 8; animation: flujo 1.1s linear infinite; }
+.edge.inactive { stroke: #90a4ae; stroke-dasharray: 3 7; opacity: 0.3; }
+.leyenda { color: #78909c; font-size: 12px; text-align: center; margin: 6px 0 2px; }
+"""
+
+
+def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict | None = None) -> str:
+    """Diagrama ANIMADO del flujo (HTML/SVG autocontenido) para embeber con components.html.
+
+    A diferencia de `diagrama()` (estático, Graphviz), esta versión resalta en un
+    loop las capas activas según los switches y hace "fluir" un paquete por los
+    caminos habilitados. No usa JavaScript: las animaciones son CSS + SMIL.
+    """
+    riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
+    color_riesgo = {"bajo": "#2e7d32", "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
+    verde, gris = "#2e7d32", "#78909c"
+    modelo = MODELO_NOMBRE if len(MODELO_NOMBRE) <= 26 else MODELO_NOMBRE[:24] + "…"
+
+    def nodo(x, y, w, h, color, lineas):
+        cx, cy = x + w / 2, y + h / 2
+        n = len(lineas)
+        txt = ""
+        for i, t in enumerate(lineas):
+            dy = (i - (n - 1) / 2) * 15
+            size = 15 if i == 0 else 11
+            peso = 600 if i == 0 else 400
+            txt += (
+                f'<text x="{cx}" y="{cy + dy + 5}" text-anchor="middle" '
+                f'font-size="{size}" fill="#ffffff" font-weight="{peso}">{t}</text>'
+            )
+        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="10" fill="{color}"/>{txt}'
+
+    # (id, path, activo, punteada)
+    aristas = [
+        ("u_g", "M 160 301 L 246 301", guard_on, False),
+        ("g_l", "M 394 301 L 466 301", guard_on, False),
+        ("u_l", "M 100 327 C 200 450, 360 450, 470 325", not guard_on, False),
+        ("l_p", "M 705 283 L 838 145", True, False),
+        ("p_d", "M 1070 118 L 1156 118", zt_on, False),
+        ("d_p", "M 1156 145 L 1070 145", zt_on, False),
+        ("p_db", "M 955 158 L 1300 285", True, False),
+        ("p_l", "M 850 152 C 780 190, 740 235, 708 275", True, True),
+        ("l_dlp", "M 695 320 L 880 410", dlp_on, False),
+        ("l_u", "M 480 335 C 300 545, 175 510, 135 330", not dlp_on, False),
+        ("dlp_u", "M 935 470 C 620 585, 250 550, 145 332", dlp_on, False),
+        ("s_d", "M 1280 470 L 1300 182", zt_on, False),
+    ]
+
+    capas, puntos = [], []
+    for i, (eid, d, activo, punteada) in enumerate(aristas):
+        clase = "edge active" if activo else "edge inactive"
+        marcador = "flecha" if activo else "flecha_gris"
+        dash = ' stroke-dasharray="9 7"' if punteada else ""
+        capas.append(f'<path id="{eid}" class="{clase}" d="{d}"{dash} marker-end="url(#{marcador})"/>')
+        if activo:
+            puntos.append(
+                f'<circle r="4.5" fill="#ffffff" opacity="0.95">'
+                f'<animateMotion dur="1.6s" begin="-{i * 0.13:.2f}s" repeatCount="indefinite">'
+                f'<mpath href="#{eid}"/></animateMotion></circle>'
+            )
+
+    nodos = [
+        nodo(40, 275, 120, 52, "#455a64", ["Usuario"]),
+        nodo(250, 270, 140, 62, verde if guard_on else gris, ["Capa 1", "Guardrail"]),
+        nodo(470, 265, 240, 72, "#6a1b9a", ["LLM", modelo]),
+        nodo(830, 90, 240, 68, verde if zt_on else gris, ["PEP", "Policy Enforcement Point"]),
+        nodo(1160, 90, 280, 90, verde if zt_on else gris, ["PDP", "Policy Engine +", "Policy Administrator"]),
+        nodo(1210, 285, 190, 62, "#1565c0", ["SQLite (simulada)"]),
+        nodo(860, 400, 210, 70, verde if dlp_on else gris, ["Capa 3", "DLP de salida"]),
+        nodo(1150, 470, 260, 76, color_riesgo, ["Señales de sesión", f"riesgo {riesgo['nivel']}"]),
+    ]
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>{_DIAGRAMA_ANIMADO_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+<svg viewBox="0 0 1480 620" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <marker id="flecha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#43a047"/>
+    </marker>
+    <marker id="flecha_gris" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#90a4ae"/>
+    </marker>
+  </defs>
+  {''.join(capas)}
+  {''.join(nodos)}
+  {''.join(puntos)}
+</svg>
+<div class="leyenda">El paquete <b>blanco</b> recorre el flujo habilitado · capas en gris = desactivadas</div>
+</div>
+</body>
+</html>"""
+
+
 def render_traza(traza: dict) -> None:
     for i, ev in enumerate(traza["eventos"], 1):
         NIVEL_UI[ev["nivel"]](f"**{i}. [{ev['capa']}]** {ev['titulo']}")
@@ -1332,7 +1439,15 @@ def main() -> None:
     if simulados:
         st.info(f"Modo simulado activo: {' y '.join(simulados)} (configurable en .env con FAKE_DB / FAKE_LLM).")
     with st.expander("Arquitectura", expanded=True):
-        st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on))
+        ver_animacion = st.toggle(
+            "Ver animación del flujo",
+            key="ver_animacion",
+            help="Alterna entre el diagrama estático (Graphviz) y la animación del flujo en loop.",
+        )
+        if ver_animacion:
+            components.html(diagrama_animado(guard_on, zt_on, dlp_on, señales), height=540)
+        else:
+            st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on))
 
     col_chat, col_consola = st.columns([1, 1.15], gap="large")
 
