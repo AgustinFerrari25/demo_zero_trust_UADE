@@ -8,6 +8,10 @@ seguridad que se activan desde la barra lateral:
 | 1 · Guardrail | Antes del LLM | Filtra el texto del usuario por patrones de prompt injection |
 | 2 · Zero Trust | Entre el LLM y la base de datos | El **PEP** pausa cada tool call y consulta al **PDP** (Policy Engine + Policy Administrator), que decide con una política declarativa *default deny* |
 
+La Capa 2 además evalúa el **contexto de la sesión** (postura): dispositivo administrado,
+MFA y red confiable. Cada señal adversa eleva el *riesgo*, y con `riesgo ≥ 1` el PDP
+deniega la acción aunque sea legítima (acceso condicional por riesgo, reglas **R6/R7**).
+
 ## Puesta en marcha
 
 ```bash
@@ -71,6 +75,20 @@ agrega un ataque contra la **confidencialidad** (fuga de datos), complementando 
    El LLM emite el tool call, el **PEP inspecciona los argumentos**, detecta la anomalía y el PDP responde
    DENY (regla **R4**). La consulta nunca se ejecuta. A diferencia del guardrail, el PDP no depende de cómo
    esté redactado el pedido: valida la acción concreta contra el contrato (*never trust, always verify*).
+
+### Tercer vector: acceso condicional por riesgo (contexto de la sesión)
+
+Zero Trust no decide solo por *quién* pide y *qué* pide, sino también por el **contexto**
+en que lo pide. La pestaña lateral **Postura de la sesión** controla tres señales:
+dispositivo administrado, MFA verificado y red confiable. Cualquier señal adversa
+eleva el riesgo y activa la regla **R6/R7** (DENY), incluso para una reserva legítima.
+
+9. **Misma acción, distinto contexto**: Zero Trust en **ON** y **Reserva legítima**.
+    Con la postura completa (riesgo *bajo*) el PDP responde **PERMIT (R1)** y la reserva
+    se crea. Ahora apagá **MFA verificado**: el riesgo sube a *medio* y la misma reserva
+    legítima cae por **DENY (R6)** — el indicador de riesgo pasa a ámbar/rojo y se ve en
+    la consola la postura débil. Volvé a prender MFA y la acción se autoriza de nuevo.
+    *Conclusión: la autorización depende del contexto, no de una lista fija de acciones.*
 
 ## Notas
 

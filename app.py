@@ -395,6 +395,51 @@ def detectar_sqli(argumentos: dict) -> list[str]:
     return sorted(set(hallazgos))
 
 
+# -----------------------------------------------------------------------------
+# Señales de contexto y riesgo (postura de la sesión)
+# -----------------------------------------------------------------------------
+# En Zero Trust la decisión no depende sólo de QUIÉN pide y QUÉ pide, sino
+# también del CONTEXTO en que lo pide: dispositivo administrado, MFA presente y
+# red confiable. Cada señal adversa eleva el riesgo y puede convertir un PERMIT
+# en DENY, aunque la acción sea legítima ("never trust, always verify").
+
+SEÑALES_DEFECTO = {
+    "dispositivo_administrado": True,
+    "mfa": True,
+    "red_confiable": True,
+}
+
+SEÑALES_INFO = {
+    "dispositivo_administrado": {
+        "titulo": "Dispositivo administrado",
+        "ayuda": "El equipo está gestionado por la organización (MDM).",
+        "adversa": "dispositivo_no_administrado",
+    },
+    "mfa": {
+        "titulo": "MFA verificado",
+        "ayuda": "La sesión se autenticó con un segundo factor.",
+        "adversa": "sin_mfa",
+    },
+    "red_confiable": {
+        "titulo": "Red confiable",
+        "ayuda": "El origen está en la red corporativa / VPN.",
+        "adversa": "red_no_confiable",
+    },
+}
+
+
+def evaluar_riesgo(señales: dict) -> dict:
+    """Calcula el score de riesgo a partir de las señales de postura.
+
+    score = cantidad de señales adversas (0..3). Cualquier señal adversa
+    (score >= 1) alcanza para bloquear acciones de la IA según la política.
+    """
+    adversas = [info["adversa"] for clave, info in SEÑALES_INFO.items() if not señales.get(clave, False)]
+    score = len(adversas)
+    nivel = "bajo" if score == 0 else "medio" if score == 1 else "alto"
+    return {"score": score, "nivel": nivel, "senales_adversas": adversas}
+
+
 # Política declarativa (datos, no código). Denegación por defecto.
 POLITICA = {
     "version": "1.0",
@@ -441,6 +486,26 @@ POLITICA = {
             "condiciones": {"autenticado": True},
             "descripcion": "El asistente de IA puede buscar reservas por un nombre bien formado.",
         },
+        {
+            "id": "R6",
+            "sujeto": "Microservicio_IA",
+            "accion": "crear_reserva",
+            "efecto": "DENY",
+            "condiciones": {"riesgo_minimo": 1},
+            "descripcion": (
+                "Contexto de riesgo: la sesión no cumple la postura mínima "
+                "(dispositivo administrado + MFA + red confiable). Aunque la acción sea "
+                "legítima, no se autoriza (acceso condicional por riesgo)."
+            ),
+        },
+        {
+            "id": "R7",
+            "sujeto": "Microservicio_IA",
+            "accion": "buscar_reserva",
+            "efecto": "DENY",
+            "condiciones": {"riesgo_minimo": 1},
+            "descripcion": "Contexto de riesgo: lectura bloqueada por postura de sesión insuficiente.",
+        },
     ],
 }
 
@@ -453,11 +518,24 @@ def policy_engine_evaluate(context: dict) -> dict:
     sujeto = context["subject"]
     accion = context["action"]["tool"]
     anomalias = context["action"].get("anomalias") or []
+    riesgo = context.get("risk") or {"score": 0, "nivel": "bajo", "senales_adversas": []}
+
+    def _cumple(clave: str, valor) -> bool:
+        """Evalúa una condición de política.
+
+        - `riesgo_maximo` / `riesgo_minimo`: comparan el score de riesgo de la sesión.
+        - cualquier otra clave: igualdad contra el sujeto (autenticado, mfa, ...).
+        """
+        if clave == "riesgo_maximo":
+            return riesgo["score"] <= valor
+        if clave == "riesgo_minimo":
+            return riesgo["score"] >= valor
+        return sujeto.get(clave) == valor
 
     def _aplica(r: dict) -> bool:
         if r["sujeto"] != sujeto["identity"] or r["accion"] != accion:
             return False
-        if not all(sujeto.get(k) == v for k, v in r["condiciones"].items()):
+        if not all(_cumple(k, v) for k, v in r["condiciones"].items()):
             return False
         # Reglas condicionadas al análisis de los argumentos (p. ej. inyección SQL).
         if r.get("cuando") == "argumentos_anomalos" and not anomalias:
@@ -470,6 +548,9 @@ def policy_engine_evaluate(context: dict) -> dict:
             motivo = regla["descripcion"]
             if regla.get("cuando") == "argumentos_anomalos" and anomalias:
                 motivo += f" Firmas: {', '.join(anomalias)}."
+            if any(k in regla["condiciones"] for k in ("riesgo_minimo", "riesgo_maximo")):
+                detalle = ", ".join(riesgo["senales_adversas"]) or "sin señales adversas"
+                motivo += f" Riesgo de la sesión: {riesgo['score']} ({riesgo['nivel']}) — {detalle}."
             return {"decision": "DENY", "regla": regla["id"], "motivo": motivo}
     for regla in aplicables:
         if regla["efecto"] == "PERMIT":
@@ -537,6 +618,7 @@ def policy_administrator(resultado: dict, context: dict, consola: Consola) -> di
             "sujeto": context["subject"]["identity"],
             "accion": context["action"]["tool"],
             "recurso": context["resource"]["name"],
+            "riesgo": (context.get("risk") or {}).get("nivel"),
             "decision": resultado["decision"],
             "regla": resultado["regla"],
         }
@@ -549,8 +631,20 @@ def policy_administrator(resultado: dict, context: dict, consola: Consola) -> di
 # =============================================================================
 
 
-def PEP_intercept(tool_call, identity: str, tabla: str, zt_on: bool, guard_on: bool, consola: Consola) -> dict:
+def PEP_intercept(
+    tool_call,
+    identity: str,
+    tabla: str,
+    zt_on: bool,
+    guard_on: bool,
+    consola: Consola,
+    señales: dict | None = None,
+) -> dict:
     """Intercepta el tool call del LLM, consulta al PDP y solo ejecuta si hay PERMIT.
+
+    `señales` describe la postura de la sesión (dispositivo, MFA, red). El PEP las
+    incorpora al contexto para que el PDP decida también por riesgo, no sólo por
+    quién pide y qué pide.
 
     Devuelve el resultado que se le informa al LLM como mensaje `tool`.
     """
@@ -560,7 +654,20 @@ def PEP_intercept(tool_call, identity: str, tabla: str, zt_on: bool, guard_on: b
     except json.JSONDecodeError:
         argumentos = {}
 
+    señales = señales or SEÑALES_DEFECTO
+    riesgo = evaluar_riesgo(señales)
+
     consola.log("PEP", "warning", f"Ejecución PAUSADA — se interceptó `{nombre}({argumentos})`")
+
+    if riesgo["senales_adversas"]:
+        consola.log(
+            "PEP",
+            "warning",
+            f"Postura de sesión débil — riesgo {riesgo['nivel']} (score {riesgo['score']}): "
+            f"{', '.join(riesgo['senales_adversas'])}",
+        )
+    else:
+        consola.log("PEP", "info", "Postura de sesión correcta (riesgo bajo — sin señales adversas)")
 
     anomalias = detectar_sqli(argumentos)
     if anomalias:
@@ -573,7 +680,14 @@ def PEP_intercept(tool_call, identity: str, tabla: str, zt_on: bool, guard_on: b
     context = {
         "request_id": uuid.uuid4().hex[:12],
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "subject": {"identity": identity, "type": "service_account", "autenticado": True, "mfa": False},
+        "subject": {
+            "identity": identity,
+            "type": "service_account",
+            "autenticado": True,
+            "mfa": señales["mfa"],
+            "dispositivo_administrado": señales["dispositivo_administrado"],
+        },
+        "risk": {**riesgo, "red_confiable": señales["red_confiable"]},
         "action": {"tool": nombre, "arguments": argumentos, "anomalias": anomalias},
         "resource": {"type": "db_table", "engine": DB_MOTOR, "name": tabla},
         "environment": {"origen": "llm_tool_call", "guardrail_activo": guard_on, "canal": "chat_publico"},
@@ -806,7 +920,14 @@ MAX_RONDAS_TOOLS = 3
 MAX_HISTORIAL = 6
 
 
-def procesar_mensaje(prompt: str, historial: list, guard_on: bool, zt_on: bool, consola: Consola) -> dict:
+def procesar_mensaje(
+    prompt: str,
+    historial: list,
+    guard_on: bool,
+    zt_on: bool,
+    consola: Consola,
+    señales: dict | None = None,
+) -> dict:
     """Pipeline completo de una petición. Devuelve el mensaje del asistente."""
     escenario = escenario_activo(guard_on, zt_on)
     tabla = TABLAS[escenario]["tabla"]
@@ -814,7 +935,7 @@ def procesar_mensaje(prompt: str, historial: list, guard_on: bool, zt_on: bool, 
         "USUARIO",
         "info",
         f"Mensaje recibido → escenario **{TABLAS[escenario]['titulo']}** (tabla `{tabla}`)",
-        {"texto": prompt, "guardrails": guard_on, "zero_trust": zt_on},
+        {"texto": prompt, "guardrails": guard_on, "zero_trust": zt_on, "señales": señales or SEÑALES_DEFECTO},
     )
 
     # ---- Capa 1: Guardrail -------------------------------------------------
@@ -885,7 +1006,7 @@ def procesar_mensaje(prompt: str, historial: list, guard_on: bool, zt_on: bool, 
             }
         )
         for tc in msg.tool_calls:
-            resultado = PEP_intercept(tc, AI_IDENTITY, tabla, zt_on, guard_on, consola)
+            resultado = PEP_intercept(tc, AI_IDENTITY, tabla, zt_on, guard_on, consola, señales)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(resultado, default=str)})
 
     consola.log("LLM", "warning", "Se alcanzó el límite de rondas de herramientas")
@@ -911,10 +1032,12 @@ def init_state() -> None:
     st.session_state.setdefault("pendiente", None)
 
 
-def diagrama(guard_on: bool, zt_on: bool) -> str:
+def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None) -> str:
     on, off = "#2e7d32", "#9e9e9e"
     g_color = on if guard_on else off
     z_color = on if zt_on else off
+    riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
+    s_color = {"bajo": on, "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
     return f"""
     digraph G {{
       rankdir=LR; bgcolor="transparent";
@@ -923,12 +1046,14 @@ def diagrama(guard_on: bool, zt_on: bool) -> str:
       U  [label="Usuario"];
       G  [label="Capa 1\\nGuardrail", fillcolor="{g_color}"];
       L  [label="LLM\\n({MODELO_NOMBRE})", fillcolor="#6a1b9a"];
+      S  [label="Señales de sesión\\n(dispositivo · MFA · red)\\nriesgo {riesgo['nivel']}", fillcolor="{s_color}"];
       P  [label="PEP\\nPolicy Enforcement Point", fillcolor="{z_color}"];
       D  [label="PDP\\nPolicy Engine +\\nPolicy Administrator", fillcolor="{z_color}"];
       DB [label="{DB_MOTOR}", shape=cylinder, fillcolor="#1565c0"];
       U -> G -> L;
       L -> P [label="tool_call"];
       P -> D [label="contexto"];
+      S -> D [label="postura / riesgo"];
       D -> P [label="PERMIT / DENY"];
       P -> DB [label="solo si PERMIT"];
     }}"""
@@ -989,7 +1114,7 @@ def render_tablas(escenario: str) -> None:
                 st.rerun()
 
 
-def render_sidebar() -> tuple[bool, bool]:
+def render_sidebar() -> tuple[bool, bool, dict]:
     with st.sidebar:
         st.header("Capas de seguridad")
         guard_on = st.toggle("Activar Guardrails", key="guard_on", help="Capa 1: filtro de entrada antes del LLM")
@@ -997,6 +1122,24 @@ def render_sidebar() -> tuple[bool, bool]:
 
         escenario = escenario_activo(guard_on, zt_on)
         st.caption(f"Tabla destino: `{TABLAS[escenario]['tabla']}`")
+
+        st.divider()
+        with st.expander("Postura de la sesión (señales Zero Trust)", expanded=False):
+            st.caption(
+                "Contexto con el que el PDP evalúa cada acción. Cualquier señal adversa "
+                "eleva el riesgo y puede convertir un PERMIT en DENY."
+            )
+            for clave, info in SEÑALES_INFO.items():
+                st.toggle(
+                    info["titulo"],
+                    key=f"senal_{clave}",
+                    value=SEÑALES_DEFECTO[clave],
+                    help=info["ayuda"],
+                )
+        señales = {clave: st.session_state[f"senal_{clave}"] for clave in SEÑALES_INFO}
+        riesgo = evaluar_riesgo(señales)
+        color = {"bajo": "green", "medio": "orange", "alto": "red"}[riesgo["nivel"]]
+        st.markdown(f"Riesgo de la sesión: :{color}[**{riesgo['nivel'].upper()}**] (score {riesgo['score']})")
 
         st.divider()
         st.subheader("Prompts de la demo")
@@ -1034,7 +1177,7 @@ def render_sidebar() -> tuple[bool, bool]:
                     st.error(f"Error: {e}")
                 else:
                     st.success("Tablas creadas")
-    return guard_on, zt_on
+    return guard_on, zt_on, señales
 
 
 def main() -> None:
@@ -1045,7 +1188,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         st.error(f"No se pudo crear la base simulada: {e}")
 
-    guard_on, zt_on = render_sidebar()
+    guard_on, zt_on, señales = render_sidebar()
 
     st.title("Hotel Aws — Defensa en Profundidad para LLMs")
     st.caption("Prompt Injection vs. Guardrails + Zero Trust Architecture (NIST SP 800-207: PEP / PDP)")
@@ -1053,7 +1196,7 @@ def main() -> None:
     if simulados:
         st.info(f"Modo simulado activo: {' y '.join(simulados)} (configurable en .env con FAKE_DB / FAKE_LLM).")
     with st.expander("Arquitectura", expanded=True):
-        st.graphviz_chart(diagrama(guard_on, zt_on))
+        st.graphviz_chart(diagrama(guard_on, zt_on, señales))
 
     col_chat, col_consola = st.columns([1, 1.15], gap="large")
 
@@ -1083,7 +1226,7 @@ def main() -> None:
             with st.chat_message("user"):
                 st.markdown(prompt)
             with st.chat_message("assistant"), st.spinner("Procesando por las capas de seguridad…"):
-                respuesta = procesar_mensaje(prompt, st.session_state.mensajes, guard_on, zt_on, consola)
+                respuesta = procesar_mensaje(prompt, st.session_state.mensajes, guard_on, zt_on, consola, señales)
         st.session_state.mensajes.append({"role": "user", "content": prompt, "llm": respuesta["llm"]})
         st.session_state.mensajes.append({"role": "assistant", "content": respuesta["content"], "llm": respuesta["llm"]})
         st.session_state.trazas.append(consola.traza)
