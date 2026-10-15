@@ -45,7 +45,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -1159,13 +1158,65 @@ def init_state() -> None:
     st.session_state.setdefault("pendiente", None)
 
 
-def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None, dlp_on: bool = False) -> str:
+def diagrama(
+    guard_on: bool,
+    zt_on: bool,
+    señales: dict | None = None,
+    dlp_on: bool = False,
+    resaltar: bool = False,
+) -> str:
+    """Diagrama de arquitectura (Graphviz).
+
+    `resaltar=True` colorea las flechas según las capas activas (verde = habilitada,
+    gris = deshabilitada) e incluye los caminos de bypass (Usuario→LLM sin guardrail
+    y LLM→Usuario sin DLP). `resaltar=False` deja el diagrama neutro de siempre.
+    """
     on, off = "#2e7d32", "#9e9e9e"
+    VERDE, GRIS = "#2e7d32", "#b0bec5"
     g_color = on if guard_on else off
     z_color = on if zt_on else off
+    d_color = on if dlp_on else off
     riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
     s_color = {"bajo": on, "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
-    d_color = on if dlp_on else off
+
+    # o=origen, d=destino, l=etiqueta, a=activa; extras: bypass | back | dash
+    aristas = [
+        {"o": "U", "d": "G", "l": "", "a": guard_on},
+        {"o": "G", "d": "L", "l": "", "a": guard_on},
+        {"o": "U", "d": "L", "l": "bypass Capa 1", "a": not guard_on, "bypass": True},
+        {"o": "L", "d": "P", "l": "tool_call", "a": True},
+        {"o": "P", "d": "D", "l": "contexto", "a": zt_on},
+        {"o": "S", "d": "D", "l": "postura / riesgo", "a": zt_on},
+        {"o": "D", "d": "P", "l": "PERMIT / DENY", "a": zt_on},
+        {"o": "P", "d": "DB", "l": "solo si PERMIT", "a": True},
+        {"o": "P", "d": "L", "l": "resultado / denegación", "a": True, "back": True, "dash": True},
+        {"o": "L", "d": "DLP", "l": "respuesta", "a": dlp_on},
+        {"o": "DLP", "d": "U", "l": "respuesta filtrada", "a": dlp_on, "back": True},
+        {"o": "L", "d": "U", "l": "bypass Capa 3", "a": not dlp_on, "bypass": True, "back": True},
+    ]
+
+    lineas = []
+    for e in aristas:
+        if e.get("bypass") and not resaltar:
+            continue
+        attrs = [f'label="{e["l"]}"'] if e["l"] else []
+        if e.get("back"):
+            attrs.append("constraint=false")
+        if resaltar:
+            color = VERDE if e["a"] else GRIS
+            attrs += [f'color="{color}"', f'fontcolor="{color}"']
+            if e["a"]:
+                attrs.append("penwidth=2.2")
+                if e.get("dash"):
+                    attrs.append("style=dashed")
+            else:
+                attrs.append("style=dashed")
+        elif e.get("dash"):
+            attrs.append("style=dashed")
+        sufijo = f' [{", ".join(attrs)}]' if attrs else ""
+        lineas.append(f'      {e["o"]} -> {e["d"]}{sufijo};')
+    aristas_dot = "\n".join(lineas)
+
     return f"""
     digraph G {{
       rankdir=LR; bgcolor="transparent";
@@ -1179,168 +1230,8 @@ def diagrama(guard_on: bool, zt_on: bool, señales: dict | None = None, dlp_on: 
       D  [label="PDP\\nPolicy Engine +\\nPolicy Administrator", fillcolor="{z_color}"];
       DLP [label="Capa 3\\nDLP de salida", fillcolor="{d_color}"];
       DB [label="{DB_MOTOR}", shape=cylinder, fillcolor="#1565c0"];
-      U -> G -> L;
-      L -> P [label="tool_call"];
-      P -> D [label="contexto"];
-      S -> D [label="postura / riesgo"];
-      D -> P [label="PERMIT / DENY"];
-      P -> DB [label="solo si PERMIT"];
-      P -> L [label="resultado / denegación", style=dashed, constraint=false];
-      L -> DLP [label="respuesta en texto"];
-      DLP -> U [label="respuesta filtrada"];
+{aristas_dot}
     }}"""
-
-
-# Hoja de estilos del diagrama animado (CSS puro — anima y hace loop sin JS).
-_DIAGRAMA_ANIMADO_CSS = """
-* { box-sizing: border-box; }
-body { margin: 0; background: transparent; font-family: Helvetica, Arial, sans-serif; }
-.wrap { width: 100%; }
-svg { width: 100%; height: auto; display: block; }
-.edge { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-.edge.active { stroke: #43a047; stroke-dasharray: 10 8; }
-.edge.inactive { stroke: #90a4ae; stroke-dasharray: 3 7; opacity: 0.3; }
-.paquete { filter: drop-shadow(0 0 4px #43a047); }
-.leyenda { color: #78909c; font-size: 12px; text-align: center; margin: 6px 0 2px; }
-"""
-
-
-def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict | None = None) -> str:
-    """Diagrama ANIMADO del flujo (HTML/SVG autocontenido) para embeber con components.html.
-
-    A diferencia de `diagrama()` (estático, Graphviz), esta versión resalta las
-    capas activas según los switches y hace que un ÚNICO paquete recorra el camino
-    habilitado PASO A PASO (con una pausa en cada nodo), en loop. No usa JavaScript:
-    la secuencia se logra con <animateMotion keyPoints/keyTimes> (SMIL).
-    """
-    riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
-    color_riesgo = {"bajo": "#2e7d32", "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
-    verde, gris = "#2e7d32", "#78909c"
-    modelo = MODELO_NOMBRE if len(MODELO_NOMBRE) <= 26 else MODELO_NOMBRE[:24] + "…"
-
-    def nodo(x, y, w, h, color, lineas):
-        cx, cy = x + w / 2, y + h / 2
-        n = len(lineas)
-        txt = ""
-        for i, t in enumerate(lineas):
-            dy = (i - (n - 1) / 2) * 15
-            size = 15 if i == 0 else 11
-            peso = 600 if i == 0 else 400
-            txt += (
-                f'<text x="{cx}" y="{cy + dy + 5}" text-anchor="middle" '
-                f'font-size="{size}" fill="#ffffff" font-weight="{peso}">{t}</text>'
-            )
-        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="10" fill="{color}"/>{txt}'
-
-    # Aristas como polilíneas: se usan tanto para dibujar como para el recorrido
-    # del paquete, así el punto que avanza sigue EXACTAMENTE el camino dibujado.
-    # La ida y la vuelta de cada tramo son líneas DISTINTAS y paralelas, para que
-    # sus flechas no se superpongan (p. ej. LLM↔PEP y los bypass de abajo).
-    E = {
-        "u_g":   [(160, 301), (250, 301)],
-        "g_l":   [(390, 301), (470, 301)],
-        "u_l":   [(118, 329), (238, 396), (350, 410), (444, 378), (468, 332)],
-        "l_p":   [(719, 316), (959, 173)],
-        "p_d":   [(1072, 112), (1156, 112)],
-        "d_p":   [(1156, 152), (1072, 152)],
-        "p_db":  [(952, 166), (1300, 284)],
-        "p_l":   [(941, 143), (713, 283)],
-        "l_dlp": [(700, 326), (900, 398)],
-        "l_u":   [(492, 341), (392, 470), (296, 508), (192, 480), (150, 331)],
-        "dlp_u": [(938, 468), (700, 542), (452, 550), (232, 502), (101, 328)],
-        "s_d":   [(1282, 466), (1300, 186)],
-    }
-    activo = {
-        "u_g": guard_on, "g_l": guard_on, "u_l": not guard_on,
-        "l_p": True, "p_d": zt_on, "d_p": zt_on, "p_db": True, "p_l": True,
-        "l_dlp": dlp_on, "l_u": not dlp_on, "dlp_u": dlp_on, "s_d": zt_on,
-    }
-
-    capas = []
-    for eid, pts in E.items():
-        d = "M " + " L ".join(f"{x} {y}" for x, y in pts)
-        if activo[eid]:
-            capas.append(f'<path class="edge active" d="{d}" marker-end="url(#flecha)"/>')
-        else:
-            # Sin punta de flecha en las capas desactivadas: evita que las flechas
-            # de ida y vuelta se superpongan cuando hay varias capas apagadas.
-            capas.append(f'<path class="edge inactive" d="{d}"/>')
-
-    # Recorrido del paquete, PASO A PASO, según las capas activas:
-    # Usuario → [Capa 1] → LLM → PEP → [PDP] → recurso → PEP → LLM → [Capa 3] → Usuario
-    ruta = [("u_g", False), ("g_l", False)] if guard_on else [("u_l", False)]
-    ruta += [("l_p", False)]
-    if zt_on:
-        # El PDP decide con el contexto: el paquete baja a las señales y vuelve.
-        ruta += [("p_d", False), ("s_d", True), ("s_d", False), ("d_p", False)]
-    ruta += [("p_db", False), ("p_db", True)]  # va al recurso y vuelve
-    ruta += [("p_l", False)]
-    ruta += [("l_dlp", False), ("dlp_u", False)] if dlp_on else [("l_u", False)]
-
-    puntos_ruta, pausa_idx = [], set()
-    for eid, rev in ruta:
-        trozo = list(reversed(E[eid])) if rev else list(E[eid])
-        puntos_ruta.extend(trozo)
-        pausa_idx.add(len(puntos_ruta) - 1)  # pausa al llegar a cada nodo
-
-    def _dist(a, b):
-        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
-
-    camino = "M " + " L ".join(f"{x} {y}" for x, y in puntos_ruta)
-    total = sum(_dist(puntos_ruta[i - 1], puntos_ruta[i]) for i in range(1, len(puntos_ruta))) or 1.0
-    velocidad, pausa = 650.0, 0.26  # px/s y segundos de pausa por nodo
-    kp, kt, largo, t = [0.0], [0.0], 0.0, 0.0
-    for i in range(1, len(puntos_ruta)):
-        seg = _dist(puntos_ruta[i - 1], puntos_ruta[i])
-        largo += seg / total
-        t += seg / velocidad
-        kp.append(round(largo, 4))
-        kt.append(round(t, 4))
-        if i in pausa_idx:
-            t += pausa
-            kp.append(round(largo, 4))
-            kt.append(round(t, 4))
-    dur = max(t, 1.0)
-    kt = [round(v / dur, 4) for v in kt]
-    kp[0], kp[-1], kt[0], kt[-1] = 0.0, 1.0, 0.0, 1.0
-    kp_str = ";".join(str(v) for v in kp)
-    kt_str = ";".join(str(v) for v in kt)
-
-    nodos = [
-        nodo(40, 275, 120, 52, "#455a64", ["Usuario"]),
-        nodo(250, 270, 140, 62, verde if guard_on else gris, ["Capa 1", "Guardrail"]),
-        nodo(470, 265, 240, 72, "#6a1b9a", ["LLM", modelo]),
-        nodo(830, 90, 240, 68, verde if zt_on else gris, ["PEP", "Policy Enforcement Point"]),
-        nodo(1160, 90, 280, 90, verde if zt_on else gris, ["PDP", "Policy Engine +", "Policy Administrator"]),
-        nodo(1210, 285, 190, 62, "#1565c0", ["SQLite (simulada)"]),
-        nodo(860, 400, 210, 70, verde if dlp_on else gris, ["Capa 3", "DLP de salida"]),
-        nodo(1150, 470, 260, 76, color_riesgo, ["Señales de sesión", f"riesgo {riesgo['nivel']}"]),
-    ]
-
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8">
-<style>{_DIAGRAMA_ANIMADO_CSS}</style>
-</head>
-<body>
-<div class="wrap">
-<svg viewBox="0 0 1480 620" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
-  <defs>
-    <marker id="flecha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#43a047"/>
-    </marker>
-  </defs>
-  {''.join(capas)}
-  {''.join(nodos)}
-  <circle class="paquete" r="6" fill="#ffffff" stroke="#43a047" stroke-width="2">
-    <animateMotion dur="{dur:.2f}s" repeatCount="indefinite" calcMode="linear"
-      keyPoints="{kp_str}" keyTimes="{kt_str}" path="{camino}"/>
-  </circle>
-</svg>
-<div class="leyenda">El paquete <b>blanco</b> recorre el flujo paso a paso (en loop) · capas en gris = desactivadas</div>
-</div>
-</body>
-</html>"""
 
 
 def render_traza(traza: dict) -> None:
@@ -1469,18 +1360,6 @@ def render_sidebar() -> tuple[bool, bool, bool, dict]:
     return guard_on, zt_on, dlp_on, señales
 
 
-def _embed_html(html: str, height: int) -> None:
-    """Embebe HTML autocontenido en un iframe.
-
-    Usa `st.iframe` (API nueva) y cae a `components.html` en versiones viejas de
-    Streamlit, donde `st.iframe` todavía no existe.
-    """
-    if hasattr(st, "iframe"):
-        st.iframe(html, height=height)
-    else:  # pragma: no cover - compatibilidad con Streamlit < 1.6x
-        components.html(html, height=height)
-
-
 def main() -> None:
     st.set_page_config(page_title="Zero Trust para LLMs", layout="wide")
     init_state()
@@ -1497,15 +1376,12 @@ def main() -> None:
     if simulados:
         st.info(f"Modo simulado activo: {' y '.join(simulados)} (configurable en .env con FAKE_DB / FAKE_LLM).")
     with st.expander("Arquitectura", expanded=True):
-        ver_animacion = st.toggle(
-            "Ver animación del flujo",
-            key="ver_animacion",
-            help="Alterna entre el diagrama estático (Graphviz) y la animación del flujo en loop.",
+        resaltar = st.toggle(
+            "Resaltar el flujo activo",
+            key="resaltar_flujo",
+            help="Colorea las flechas según las capas activas: verde = habilitada, gris = deshabilitada.",
         )
-        if ver_animacion:
-            _embed_html(diagrama_animado(guard_on, zt_on, dlp_on, señales), height=540)
-        else:
-            st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on))
+        st.graphviz_chart(diagrama(guard_on, zt_on, señales, dlp_on, resaltar))
 
     col_chat, col_consola = st.columns([1, 1.15], gap="large")
 
