@@ -1197,10 +1197,10 @@ _DIAGRAMA_ANIMADO_CSS = """
 body { margin: 0; background: transparent; font-family: Helvetica, Arial, sans-serif; }
 .wrap { width: 100%; }
 svg { width: 100%; height: auto; display: block; }
-@keyframes flujo { to { stroke-dashoffset: -32; } }
-.edge { fill: none; stroke-width: 3; stroke-linecap: round; }
-.edge.active { stroke: #43a047; stroke-dasharray: 10 8; animation: flujo 1.1s linear infinite; }
+.edge { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.edge.active { stroke: #43a047; stroke-dasharray: 10 8; }
 .edge.inactive { stroke: #90a4ae; stroke-dasharray: 3 7; opacity: 0.3; }
+.paquete { filter: drop-shadow(0 0 4px #43a047); }
 .leyenda { color: #78909c; font-size: 12px; text-align: center; margin: 6px 0 2px; }
 """
 
@@ -1208,9 +1208,10 @@ svg { width: 100%; height: auto; display: block; }
 def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict | None = None) -> str:
     """Diagrama ANIMADO del flujo (HTML/SVG autocontenido) para embeber con components.html.
 
-    A diferencia de `diagrama()` (estático, Graphviz), esta versión resalta en un
-    loop las capas activas según los switches y hace "fluir" un paquete por los
-    caminos habilitados. No usa JavaScript: las animaciones son CSS + SMIL.
+    A diferencia de `diagrama()` (estático, Graphviz), esta versión resalta las
+    capas activas según los switches y hace que un ÚNICO paquete recorra el camino
+    habilitado PASO A PASO (con una pausa en cada nodo), en loop. No usa JavaScript:
+    la secuencia se logra con <animateMotion keyPoints/keyTimes> (SMIL).
     """
     riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
     color_riesgo = {"bajo": "#2e7d32", "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
@@ -1231,34 +1232,73 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
             )
         return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="10" fill="{color}"/>{txt}'
 
-    # (id, path, activo, punteada)
-    aristas = [
-        ("u_g", "M 160 301 L 246 301", guard_on, False),
-        ("g_l", "M 394 301 L 466 301", guard_on, False),
-        ("u_l", "M 100 327 C 200 450, 360 450, 470 325", not guard_on, False),
-        ("l_p", "M 705 283 L 838 145", True, False),
-        ("p_d", "M 1070 118 L 1156 118", zt_on, False),
-        ("d_p", "M 1156 145 L 1070 145", zt_on, False),
-        ("p_db", "M 955 158 L 1300 285", True, False),
-        ("p_l", "M 850 152 C 780 190, 740 235, 708 275", True, True),
-        ("l_dlp", "M 695 320 L 880 410", dlp_on, False),
-        ("l_u", "M 480 335 C 300 545, 175 510, 135 330", not dlp_on, False),
-        ("dlp_u", "M 935 470 C 620 585, 250 550, 145 332", dlp_on, False),
-        ("s_d", "M 1280 470 L 1300 182", zt_on, False),
-    ]
+    # Aristas como polilíneas: se usan tanto para dibujar como para el recorrido
+    # del paquete, así el punto que avanza sigue EXACTAMENTE el camino dibujado.
+    E = {
+        "u_g":   [(160, 301), (250, 301)],
+        "g_l":   [(390, 301), (470, 301)],
+        "u_l":   [(110, 322), (180, 400), (320, 432), (430, 392), (468, 330)],
+        "l_p":   [(706, 282), (836, 150)],
+        "p_d":   [(1072, 116), (1154, 116)],
+        "d_p":   [(1154, 148), (1072, 148)],
+        "p_db":  [(956, 160), (1300, 282)],
+        "p_l":   [(850, 150), (762, 222), (708, 278)],
+        "l_dlp": [(696, 320), (880, 408)],
+        "l_u":   [(478, 338), (380, 430), (300, 470), (200, 460), (136, 332)],
+        "dlp_u": [(938, 468), (700, 540), (450, 545), (250, 500), (150, 340)],
+        "s_d":   [(1280, 468), (1298, 184)],
+    }
+    activo = {
+        "u_g": guard_on, "g_l": guard_on, "u_l": not guard_on,
+        "l_p": True, "p_d": zt_on, "d_p": zt_on, "p_db": True, "p_l": True,
+        "l_dlp": dlp_on, "l_u": not dlp_on, "dlp_u": dlp_on, "s_d": zt_on,
+    }
 
-    capas, puntos = [], []
-    for i, (eid, d, activo, punteada) in enumerate(aristas):
-        clase = "edge active" if activo else "edge inactive"
-        marcador = "flecha" if activo else "flecha_gris"
-        dash = ' stroke-dasharray="9 7"' if punteada else ""
-        capas.append(f'<path id="{eid}" class="{clase}" d="{d}"{dash} marker-end="url(#{marcador})"/>')
-        if activo:
-            puntos.append(
-                f'<circle r="4.5" fill="#ffffff" opacity="0.95">'
-                f'<animateMotion dur="1.6s" begin="-{i * 0.13:.2f}s" repeatCount="indefinite">'
-                f'<mpath href="#{eid}"/></animateMotion></circle>'
-            )
+    capas = []
+    for eid, pts in E.items():
+        d = "M " + " L ".join(f"{x} {y}" for x, y in pts)
+        clase = "edge active" if activo[eid] else "edge inactive"
+        marcador = "flecha" if activo[eid] else "flecha_gris"
+        capas.append(f'<path class="{clase}" d="{d}" marker-end="url(#{marcador})"/>')
+
+    # Recorrido del paquete, PASO A PASO, según las capas activas:
+    # Usuario → [Capa 1] → LLM → PEP → [PDP] → recurso → PEP → LLM → [Capa 3] → Usuario
+    ruta = [("u_g", False), ("g_l", False)] if guard_on else [("u_l", False)]
+    ruta += [("l_p", False)]
+    if zt_on:
+        ruta += [("p_d", False), ("d_p", False)]
+    ruta += [("p_db", False), ("p_db", True)]  # va al recurso y vuelve
+    ruta += [("p_l", False)]
+    ruta += [("l_dlp", False), ("dlp_u", False)] if dlp_on else [("l_u", False)]
+
+    puntos_ruta, pausa_idx = [], set()
+    for eid, rev in ruta:
+        trozo = list(reversed(E[eid])) if rev else list(E[eid])
+        puntos_ruta.extend(trozo)
+        pausa_idx.add(len(puntos_ruta) - 1)  # pausa al llegar a cada nodo
+
+    def _dist(a, b):
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+    camino = "M " + " L ".join(f"{x} {y}" for x, y in puntos_ruta)
+    total = sum(_dist(puntos_ruta[i - 1], puntos_ruta[i]) for i in range(1, len(puntos_ruta))) or 1.0
+    velocidad, pausa = 520.0, 0.30  # px/s y segundos de pausa por nodo
+    kp, kt, largo, t = [0.0], [0.0], 0.0, 0.0
+    for i in range(1, len(puntos_ruta)):
+        seg = _dist(puntos_ruta[i - 1], puntos_ruta[i])
+        largo += seg / total
+        t += seg / velocidad
+        kp.append(round(largo, 4))
+        kt.append(round(t, 4))
+        if i in pausa_idx:
+            t += pausa
+            kp.append(round(largo, 4))
+            kt.append(round(t, 4))
+    dur = max(t, 1.0)
+    kt = [round(v / dur, 4) for v in kt]
+    kp[0], kp[-1], kt[0], kt[-1] = 0.0, 1.0, 0.0, 1.0
+    kp_str = ";".join(str(v) for v in kp)
+    kt_str = ";".join(str(v) for v in kt)
 
     nodos = [
         nodo(40, 275, 120, 52, "#455a64", ["Usuario"]),
@@ -1289,9 +1329,12 @@ def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict |
   </defs>
   {''.join(capas)}
   {''.join(nodos)}
-  {''.join(puntos)}
+  <circle class="paquete" r="6" fill="#ffffff" stroke="#43a047" stroke-width="2">
+    <animateMotion dur="{dur:.2f}s" repeatCount="indefinite" calcMode="linear"
+      keyPoints="{kp_str}" keyTimes="{kt_str}" path="{camino}"/>
+  </circle>
 </svg>
-<div class="leyenda">El paquete <b>blanco</b> recorre el flujo habilitado · capas en gris = desactivadas</div>
+<div class="leyenda">El paquete <b>blanco</b> recorre el flujo paso a paso (en loop) · capas en gris = desactivadas</div>
 </div>
 </body>
 </html>"""
