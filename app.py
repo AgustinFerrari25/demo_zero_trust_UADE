@@ -1180,27 +1180,30 @@ def diagrama(
     riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
     s_color = {"bajo": on, "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
 
-    # o=origen, d=destino, l=etiqueta, a=activa; extras: bypass | back | dash
+    # k=clave (id en el SVG), o=origen, d=destino, l=etiqueta, a=activa;
+    # extras: bypass | back | dash
     aristas = [
-        {"o": "U", "d": "G", "l": "", "a": guard_on},
-        {"o": "G", "d": "L", "l": "", "a": guard_on},
-        {"o": "U", "d": "L", "l": "bypass Capa 1", "a": not guard_on, "bypass": True},
-        {"o": "L", "d": "P", "l": "tool_call", "a": True},
-        {"o": "P", "d": "D", "l": "contexto", "a": zt_on},
-        {"o": "S", "d": "D", "l": "postura / riesgo", "a": zt_on},
-        {"o": "D", "d": "P", "l": "PERMIT / DENY", "a": zt_on},
-        {"o": "P", "d": "DB", "l": "solo si PERMIT", "a": True},
-        {"o": "P", "d": "L", "l": "resultado / denegación", "a": True, "back": True, "dash": True},
-        {"o": "L", "d": "DLP", "l": "respuesta", "a": dlp_on},
-        {"o": "DLP", "d": "U", "l": "respuesta filtrada", "a": dlp_on, "back": True},
-        {"o": "L", "d": "U", "l": "bypass Capa 3", "a": not dlp_on, "bypass": True, "back": True},
+        {"k": "u_g", "o": "U", "d": "G", "l": "", "a": guard_on},
+        {"k": "g_l", "o": "G", "d": "L", "l": "", "a": guard_on},
+        {"k": "u_l", "o": "U", "d": "L", "l": "bypass Capa 1", "a": not guard_on, "bypass": True},
+        {"k": "l_p", "o": "L", "d": "P", "l": "tool_call", "a": True},
+        {"k": "p_d", "o": "P", "d": "D", "l": "contexto", "a": zt_on},
+        {"k": "s_d", "o": "S", "d": "D", "l": "postura / riesgo", "a": zt_on},
+        {"k": "d_p", "o": "D", "d": "P", "l": "PERMIT / DENY", "a": zt_on},
+        {"k": "p_db", "o": "P", "d": "DB", "l": "solo si PERMIT", "a": True},
+        {"k": "p_l", "o": "P", "d": "L", "l": "resultado / denegación", "a": True, "back": True, "dash": True},
+        {"k": "l_dlp", "o": "L", "d": "DLP", "l": "respuesta", "a": dlp_on},
+        {"k": "dlp_u", "o": "DLP", "d": "U", "l": "respuesta filtrada", "a": dlp_on, "back": True},
+        {"k": "l_u", "o": "L", "d": "U", "l": "bypass Capa 3", "a": not dlp_on, "bypass": True, "back": True},
     ]
 
     lineas = []
     for e in aristas:
         if e.get("bypass") and not resaltar:
             continue
-        attrs = [f'label="{e["l"]}"'] if e["l"] else []
+        attrs = [f'id="e_{e["k"]}"']
+        if e["l"]:
+            attrs.append(f'label="{e["l"]}"')
         if e.get("back"):
             attrs.append("constraint=false")
         if resaltar:
@@ -1235,127 +1238,88 @@ def diagrama(
     }}"""
 
 
-# Estilos base del diagrama animado (el resto de las reglas, una por flecha, se
-# generan en diagrama_animado()).
-_DIAGRAMA_ANIMADO_CSS = """
-* { box-sizing: border-box; }
-body { margin: 0; background: transparent; font-family: Helvetica, Arial, sans-serif; }
-.wrap { width: 100%; }
-svg { width: 100%; height: auto; display: block; }
-.paso, .apagada { fill: none; stroke-linejoin: round; stroke-linecap: round; }
-.paso { stroke: #546e7a; stroke-width: 3; }
-.apagada { stroke: #37474f; stroke-width: 2.5; stroke-dasharray: 4 6; opacity: 0.4; }
-.leyenda { color: #78909c; font-size: 12px; text-align: center; margin: 6px 0 2px; }
-"""
+# Plantilla del diagrama animado. El MISMO DOT del diagrama estático se renderiza
+# con viz.js (el mismo motor que Graphviz) dentro del navegador, y luego se le
+# aplican animaciones CSS por arista (id="e_...") para encenderlas en secuencia.
+_ANIM_HTML = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js"></script>
+<style>
+  body { margin: 0; background: transparent; font-family: Helvetica, Arial, sans-serif; }
+  #graph svg { width: 100%; height: auto; display: block; }
+  .cargando { color: #78909c; font-size: 13px; text-align: center; margin: 24px; }
+  .leyenda { color: #78909c; font-size: 12px; text-align: center; margin: 6px 0 2px; }
+__CSS__
+</style>
+</head>
+<body>
+<div id="graph"><p class="cargando">Cargando Graphviz…</p></div>
+<p class="leyenda">Cada flecha se enciende cuando la data pasa por ella y se apaga al salir (en loop)</p>
+<script>
+  const DOT = __DOT__;
+  try {
+    const viz = new Viz();
+    viz.renderSVGElement(DOT).then(function (el) {
+      el.removeAttribute("height");
+      const g = document.getElementById("graph");
+      g.innerHTML = "";
+      g.appendChild(el);
+    }).catch(function () {
+      document.getElementById("graph").innerHTML = '<p class="cargando">No se pudo renderizar el diagrama.</p>';
+    });
+  } catch (e) {
+    document.getElementById("graph").innerHTML = '<p class="cargando">No se pudo cargar Graphviz (¿sin conexión?).</p>';
+  }
+</script>
+</body>
+</html>"""
 
 
 def diagrama_animado(guard_on: bool, zt_on: bool, dlp_on: bool, señales: dict | None = None) -> str:
-    """Diagrama ANIMADO del flujo (HTML/SVG autocontenido) para embeber con st.iframe.
+    """Diagrama ANIMADO del flujo, sobre el MISMO Graphviz.
 
-    Recorre el camino habilitado PASO A PASO: cada flecha se ENCIENDE cuando la
-    "data" pasa por ella y se APAGA al salir, en loop. Usa el mismo layout que el
-    diagrama Graphviz. La secuencia es puro CSS: se genera un @keyframes por flecha.
-    No usa JavaScript.
+    Renderiza el mismo DOT que `diagrama()` con viz.js en el navegador y le aplica
+    animaciones CSS por arista: cada flecha se ENCIENDE cuando la data pasa por ella
+    y se APAGA al salir, en secuencia y en loop. Las capas desactivadas y los tramos
+    que no se recorren quedan en gris punteado.
     """
-    riesgo = evaluar_riesgo(señales or SEÑALES_DEFECTO)
-    color_riesgo = {"bajo": "#2e7d32", "medio": "#ef6c00", "alto": "#c62828"}[riesgo["nivel"]]
-    verde, gris = "#2e7d32", "#78909c"
-    modelo = MODELO_NOMBRE if len(MODELO_NOMBRE) <= 26 else MODELO_NOMBRE[:24] + "…"
+    dot = diagrama(guard_on, zt_on, señales, dlp_on, resaltar=True)
 
-    def nodo(x, y, w, h, color, lineas):
-        cx, cy = x + w / 2, y + h / 2
-        n = len(lineas)
-        txt = ""
-        for i, t in enumerate(lineas):
-            dy = (i - (n - 1) / 2) * 15
-            size = 15 if i == 0 else 11
-            peso = 600 if i == 0 else 400
-            txt += (
-                f'<text x="{cx}" y="{cy + dy + 5}" text-anchor="middle" '
-                f'font-size="{size}" fill="#ffffff" font-weight="{peso}">{t}</text>'
-            )
-        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="10" fill="{color}"/>{txt}'
-
-    E = {
-        "u_g":   [(160, 301), (250, 301)],
-        "g_l":   [(390, 301), (470, 301)],
-        "u_l":   [(118, 329), (238, 396), (350, 410), (444, 378), (468, 332)],
-        "l_p":   [(719, 316), (959, 173)],
-        "p_d":   [(1072, 112), (1156, 112)],
-        "d_p":   [(1156, 152), (1072, 152)],
-        "p_db":  [(952, 166), (1300, 284)],
-        "p_l":   [(941, 143), (713, 283)],
-        "l_dlp": [(700, 326), (900, 398)],
-        "l_u":   [(492, 341), (392, 470), (296, 508), (192, 480), (150, 331)],
-        "dlp_u": [(938, 468), (700, 542), (452, 550), (232, 502), (101, 328)],
-        "s_d":   [(1282, 466), (1300, 186)],
-    }
-
-    # Secuencia de flechas que recorre la data (una por paso), según las capas activas.
+    # Secuencia de aristas que recorre la data (una por paso).
     secuencia = ["u_g", "g_l"] if guard_on else ["u_l"]
     secuencia += ["l_p"]
     if zt_on:
         secuencia += ["p_d", "s_d", "d_p"]  # el PDP consulta las señales
     secuencia += ["p_db", "p_l"]
     secuencia += ["l_dlp", "dlp_u"] if dlp_on else ["l_u"]
+    todas = ["u_g", "g_l", "u_l", "l_p", "p_d", "s_d", "d_p", "p_db", "p_l", "l_dlp", "dlp_u", "l_u"]
 
     n = max(len(secuencia), 1)
-    dur = 0.7 * n  # segundos por ciclo completo
-    slot = {}
+    dur = 0.7 * n  # segundos por ciclo
     reglas = []
-    for i, eid in enumerate(secuencia):
-        slot[eid] = i
-        p0 = 100.0 * i / n            # enciende
-        p1 = 100.0 * (i + 0.8) / n    # se apaga (deja una pausa antes del próximo paso)
+    for i, k in enumerate(secuencia):
+        p0 = 100.0 * i / n           # enciende
+        p1 = 100.0 * (i + 0.8) / n   # se apaga (deja una pausa antes del próximo paso)
         reglas.append(
-            f"@keyframes k{i}{{"
-            f"0%,{p0:.2f}%{{stroke:#546e7a;stroke-width:3}}"
-            f"{p0 + 0.02:.2f}%,{p1:.2f}%{{stroke:#43a047;stroke-width:4.6}}"
-            f"{p1 + 0.02:.2f}%,100%{{stroke:#546e7a;stroke-width:3}}"
-            f"}}"
-            f".e{i}{{animation:k{i} {dur:.2f}s linear infinite}}"
+            f"@keyframes s{i}{{0%,{p0:.2f}%{{stroke:#546e7a;stroke-width:3}}"
+            f"{p0 + 0.02:.2f}%,{p1:.2f}%{{stroke:#43a047;stroke-width:4.2}}"
+            f"{p1 + 0.02:.2f}%,100%{{stroke:#546e7a;stroke-width:3}}}}"
         )
+        reglas.append(
+            f"@keyframes f{i}{{0%,{p0:.2f}%{{fill:#546e7a}}"
+            f"{p0 + 0.02:.2f}%,{p1:.2f}%{{fill:#43a047}}"
+            f"{p1 + 0.02:.2f}%,100%{{fill:#546e7a}}}}"
+        )
+        reglas.append(f"#e_{k} path {{ animation: s{i} {dur:.2f}s linear infinite; }}")
+        reglas.append(f"#e_{k} polygon {{ animation: f{i} {dur:.2f}s linear infinite; }}")
+    for k in todas:
+        if k not in secuencia:
+            reglas.append(f"#e_{k} path {{ stroke: #90a4ae; stroke-dasharray: 4 6; opacity: .4; }}")
+            reglas.append(f"#e_{k} polygon {{ fill: #90a4ae; opacity: .4; }}")
 
-    capas = []
-    for eid, pts in E.items():
-        d = "M " + " L ".join(f"{x} {y}" for x, y in pts)
-        if eid in slot:
-            capas.append(f'<path class="paso e{slot[eid]}" d="{d}" marker-end="url(#flecha)"/>')
-        else:
-            capas.append(f'<path class="apagada" d="{d}"/>')
-
-    nodos = [
-        nodo(40, 275, 120, 52, "#455a64", ["Usuario"]),
-        nodo(250, 270, 140, 62, verde if guard_on else gris, ["Capa 1", "Guardrail"]),
-        nodo(470, 265, 240, 72, "#6a1b9a", ["LLM", modelo]),
-        nodo(830, 90, 240, 68, verde if zt_on else gris, ["PEP", "Policy Enforcement Point"]),
-        nodo(1160, 90, 280, 90, verde if zt_on else gris, ["PDP", "Policy Engine +", "Policy Administrator"]),
-        nodo(1210, 285, 190, 62, "#1565c0", ["SQLite (simulada)"]),
-        nodo(860, 400, 210, 70, verde if dlp_on else gris, ["Capa 3", "DLP de salida"]),
-        nodo(1150, 470, 260, 76, color_riesgo, ["Señales de sesión", f"riesgo {riesgo['nivel']}"]),
-    ]
-
-    css = _DIAGRAMA_ANIMADO_CSS + "\n" + "\n".join(reglas)
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8">
-<style>{css}</style>
-</head>
-<body>
-<div class="wrap">
-<svg viewBox="0 0 1480 620" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <marker id="flecha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#43a047"/>
-    </marker>
-  </defs>
-  {''.join(capas)}
-  {''.join(nodos)}
-</svg>
-<div class="leyenda">Cada flecha se enciende cuando la data pasa por ella y se apaga al salir (en loop) · capas en gris = desactivadas</div>
-</div>
-</body>
-</html>"""
+    return _ANIM_HTML.replace("__CSS__", "\n".join(reglas)).replace("__DOT__", json.dumps(dot))
 
 
 def render_traza(traza: dict) -> None:
