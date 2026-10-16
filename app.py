@@ -629,26 +629,32 @@ POLITICA = {
 }
 
 
-def policy_engine_evaluate(context: dict) -> dict:
+def policy_engine_evaluate(context: dict, señales: dict | None = None) -> dict:
     """Policy Engine (PE): aplica la política al contexto y decide.
 
+    Consume las **señales de sesión** (postura) que le llegan de las fuentes
+    externas (IdP, MDM, red) — no del PEP.
     Orden de evaluación: DENY explícito > PERMIT > default DENY.
     """
+    señales = señales or SEÑALES_DEFECTO
     sujeto = context["subject"]
     accion = context["action"]["tool"]
     anomalias = context["action"].get("anomalias") or []
-    riesgo = context.get("risk") or {"score": 0, "nivel": "bajo", "senales_adversas": []}
+    riesgo = evaluar_riesgo(señales)
 
     def _cumple(clave: str, valor) -> bool:
         """Evalúa una condición de política.
 
         - `riesgo_maximo` / `riesgo_minimo`: comparan el score de riesgo de la sesión.
-        - cualquier otra clave: igualdad contra el sujeto (autenticado, mfa, ...).
+        - `mfa`, `dispositivo_administrado`, `red_confiable`: vienen de las señales.
+        - cualquier otra clave: igualdad contra el sujeto (autenticado, ...).
         """
         if clave == "riesgo_maximo":
             return riesgo["score"] <= valor
         if clave == "riesgo_minimo":
             return riesgo["score"] >= valor
+        if clave in señales:
+            return señales[clave] == valor
         return sujeto.get(clave) == valor
 
     def _aplica(r: dict) -> bool:
@@ -681,8 +687,11 @@ def policy_engine_evaluate(context: dict) -> dict:
     }
 
 
-def PDP_evaluate(context: dict, enforce: bool, consola: Consola) -> dict:
+def PDP_evaluate(context: dict, enforce: bool, consola: Consola, señales: dict | None = None) -> dict:
     """Policy Decision Point.
+
+    El PDP (Policy Engine + Policy Administrator) es el que **consume las señales
+    de sesión** — en un sistema real las consulta a sus fuentes (IdP, MDM, red).
 
     enforce=False simula la arquitectura tradicional de perímetro: todo lo que
     está "adentro" de la red se considera confiable.
@@ -695,8 +704,20 @@ def PDP_evaluate(context: dict, enforce: bool, consola: Consola) -> dict:
         )
         return {"decision": "PERMIT", "regla": None, "motivo": "Confianza implícita por estar dentro del perímetro."}
 
+    señales = señales or SEÑALES_DEFECTO
+    riesgo = evaluar_riesgo(señales)
+    if riesgo["senales_adversas"]:
+        consola.log(
+            "PDP · Policy Engine",
+            "warning",
+            f"Contexto de sesión débil — riesgo {riesgo['nivel']} (score {riesgo['score']}): "
+            f"{', '.join(riesgo['senales_adversas'])}",
+        )
+    else:
+        consola.log("PDP · Policy Engine", "info", "Contexto de sesión correcto (riesgo bajo — sin señales adversas)")
+
     t0 = time.perf_counter()
-    resultado = policy_engine_evaluate(context)
+    resultado = policy_engine_evaluate(context, señales)
     ms = (time.perf_counter() - t0) * 1000
     consola.log(
         "PDP · Policy Engine",
@@ -704,10 +725,10 @@ def PDP_evaluate(context: dict, enforce: bool, consola: Consola) -> dict:
         f"Política evaluada en {ms:.2f} ms → regla **{resultado['regla']}**",
         resultado,
     )
-    return policy_administrator(resultado, context, consola)
+    return policy_administrator(resultado, context, consola, riesgo)
 
 
-def policy_administrator(resultado: dict, context: dict, consola: Consola) -> dict:
+def policy_administrator(resultado: dict, context: dict, consola: Consola, riesgo: dict | None = None) -> dict:
     """Policy Administrator (PA): comunica la decisión al PEP y la audita."""
     decision = {
         **resultado,
@@ -737,7 +758,7 @@ def policy_administrator(resultado: dict, context: dict, consola: Consola) -> di
             "sujeto": context["subject"]["identity"],
             "accion": context["action"]["tool"],
             "recurso": context["resource"]["name"],
-            "riesgo": (context.get("risk") or {}).get("nivel"),
+            "riesgo": (riesgo or {}).get("nivel"),
             "decision": resultado["decision"],
             "regla": resultado["regla"],
         }
@@ -761,9 +782,9 @@ def PEP_intercept(
 ) -> dict:
     """Intercepta el tool call del LLM, consulta al PDP y solo ejecuta si hay PERMIT.
 
-    `señales` describe la postura de la sesión (dispositivo, MFA, red). El PEP las
-    incorpora al contexto para que el PDP decida también por riesgo, no sólo por
-    quién pide y qué pide.
+    El PEP manda el **pedido** (identidad, acción, recurso, entorno); la **postura de
+    sesión** no va en el contexto — la consume el PDP (Policy Engine) desde sus
+    fuentes. `señales` se pasa al PDP para simular esas fuentes.
 
     Devuelve el resultado que se le informa al LLM como mensaje `tool`.
     """
@@ -773,20 +794,7 @@ def PEP_intercept(
     except json.JSONDecodeError:
         argumentos = {}
 
-    señales = señales or SEÑALES_DEFECTO
-    riesgo = evaluar_riesgo(señales)
-
     consola.log("PEP", "warning", f"Ejecución PAUSADA — se interceptó `{nombre}({argumentos})`")
-
-    if riesgo["senales_adversas"]:
-        consola.log(
-            "PEP",
-            "warning",
-            f"Postura de sesión débil — riesgo {riesgo['nivel']} (score {riesgo['score']}): "
-            f"{', '.join(riesgo['senales_adversas'])}",
-        )
-    else:
-        consola.log("PEP", "info", "Postura de sesión correcta (riesgo bajo — sin señales adversas)")
 
     anomalias = detectar_sqli(argumentos)
     if anomalias:
@@ -799,21 +807,14 @@ def PEP_intercept(
     context = {
         "request_id": uuid.uuid4().hex[:12],
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "subject": {
-            "identity": identity,
-            "type": "service_account",
-            "autenticado": True,
-            "mfa": señales["mfa"],
-            "dispositivo_administrado": señales["dispositivo_administrado"],
-        },
-        "risk": {**riesgo, "red_confiable": señales["red_confiable"]},
+        "subject": {"identity": identity, "type": "service_account", "autenticado": True},
         "action": {"tool": nombre, "arguments": argumentos, "anomalias": anomalias},
         "resource": {"type": "db_table", "engine": DB_MOTOR, "name": tabla},
         "environment": {"origen": "llm_tool_call", "guardrail_activo": guard_on, "canal": "chat_publico"},
     }
     consola.log("PEP → PDP", "info", "Contexto enviado al PDP para decisión", context, expandir=True)
 
-    decision = PDP_evaluate(context, enforce=zt_on, consola=consola)
+    decision = PDP_evaluate(context, enforce=zt_on, consola=consola, señales=señales)
 
     if decision["decision"] != "PERMIT":
         consola.log(
@@ -1195,6 +1196,8 @@ def diagrama(
         {"k": "l_dlp", "o": "L", "d": "DLP", "l": "respuesta", "a": dlp_on},
         {"k": "dlp_u", "o": "DLP", "d": "U", "l": "respuesta filtrada", "a": dlp_on, "back": True},
         {"k": "l_u", "o": "L", "d": "U", "l": "bypass Capa 3", "a": not dlp_on, "bypass": True, "back": True},
+        # Fuente de contexto: los sistemas externos que alimentan las señales de sesión.
+        {"k": "ext_s", "o": "EXT", "d": "S", "l": "contexto de sesión", "a": True},
     ]
 
     lineas = []
@@ -1229,6 +1232,7 @@ def diagrama(
       U  [label="Usuario"];
       G  [label="Capa 1\\nGuardrail", fillcolor="{g_color}"];
       L  [label="LLM\\n({MODELO_NOMBRE})", fillcolor="#6a1b9a"];
+      EXT [label="Fuentes externas\\n(IdP · MDM · red)", fillcolor="#37474f"];
       S  [label="Señales de sesión\\n(dispositivo · MFA · red)\\nriesgo {riesgo['nivel']}", fillcolor="{s_color}"];
       P  [label="PEP\\nPolicy Enforcement Point", fillcolor="{z_color}"];
       D  [label="PDP\\nPolicy Engine +\\nPolicy Administrator", fillcolor="{z_color}"];
